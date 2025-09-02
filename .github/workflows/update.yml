@@ -1,0 +1,193 @@
+name: Update blocklists (fetch → merge → release)
+
+# Triggers: scheduled twice daily, manual dispatch, and when sources.txt changes
+on:
+  schedule:
+    - cron: "0 2 * * *"   # 02:00 UTC daily
+    - cron: "0 14 * * *"  # 14:00 UTC daily
+  workflow_dispatch: {}    # allow manual runs
+  push:
+    paths:
+      - "sources.txt"
+
+# We need write access so the workflow can create/update releases and upload assets
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    name: Fetch, merge, and publish merged-latest
+    runs-on: ubuntu-latest
+
+    # Conservative defaults — tweak these environment variables if you want to change behavior.
+    env:
+      FETCH_CONCURRENCY: 1             # 1 = sequential; raise to enable parallel downloads
+      FETCH_PER_HOST: 2               # max concurrent requests to the same hostname
+      FETCH_MIN_PER_HOST_INTERVAL: 0.5 # seconds between requests to same host
+      FETCH_TIMEOUT: 30               # per-request timeout seconds
+      FETCH_MAX_BYTES: 0              # 0 = disabled; >0 will skip very large downloads
+      CACHE_DIR: output/cache
+      RAW_OUT: output/_raw.txt
+      MERGED_OUT: output/merged.txt
+
+    steps:
+
+      # -----------------------------
+      # 1) Checkout repository
+      # -----------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # full history so create-release / branch operations behave predictably
+          fetch-depth: 0
+          persist-credentials: true
+
+      # -----------------------------
+      # 2) Setup Python
+      # -----------------------------
+      - name: Setup Python 3.x
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      # -----------------------------
+      # 3) Restore pip cache (optional)
+      # -----------------------------
+      - name: Restore pip cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          # matrix variables are not present in this workflow; use a stable key
+          key: pip-${{ runner.os }}-py-${{ hashFiles('**/pyproject.toml','**/requirements*.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-py-
+
+      - name: Install lightweight runtime deps
+        # keep installs minimal — scripts only require 'requests' and stdlib
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --disable-pip-version-check requests
+
+      # -----------------------------
+      # 4) Restore previously cached downloaded lists (output/cache)
+      # -----------------------------
+      - name: Restore HTTP cache (output/cache)
+        uses: actions/cache@v4
+        with:
+          # key is derived from sources.txt contents so changing sources causes a new key
+          path: ${{ env.CACHE_DIR }}
+          key: fetch-cache-${{ runner.os }}-${{ hashFiles('sources.txt') }}
+          restore-keys: |
+            fetch-cache-${{ runner.os }}-
+
+      # Note: actions/cache will attempt to upload the cache at the end of the job if
+      # the key was not found (i.e. on cache-miss). You don't need an explicit "save" step.
+
+      # -----------------------------
+      # 5) Compact cache debug (keeps logs small)
+      # -----------------------------
+      - name: Show cache (compact)
+        if: ${{ always() }}
+        run: |
+          echo "cache path: ${{ env.CACHE_DIR }}"
+          if [ -d "${{ env.CACHE_DIR }}" ]; then
+            echo "dat files: $(ls -1 ${{ env.CACHE_DIR }}/*.dat 2>/dev/null | wc -l)"
+            echo "meta.json files: $(ls -1 ${{ env.CACHE_DIR }}/*.meta.json 2>/dev/null | wc -l)"
+            # show a tiny example (first meta) so logs are useful but bounded
+            if ls ${{ env.CACHE_DIR }}/*.meta.json >/dev/null 2>&1; then
+              FIRST_META=$(ls ${{ env.CACHE_DIR }}/*.meta.json | head -n1)
+              echo "example meta (first 80 chars):"
+              head -c 80 "$FIRST_META" || true
+              echo "..."
+            fi
+          else
+            echo "no cache directory present"
+          fi
+
+      # -----------------------------
+      # 6) Fetch sources (uses scripts/fetch_sources.py)
+      # -----------------------------
+      - name: Fetch sources
+        env:
+          CACHE_PATH: ${{ env.CACHE_DIR }}
+          RAW_OUT: ${{ env.RAW_OUT }}
+          FETCH_CONCURRENCY: ${{ env.FETCH_CONCURRENCY }}
+          FETCH_PER_HOST: ${{ env.FETCH_PER_HOST }}
+          FETCH_MIN_PER_HOST_INTERVAL: ${{ env.FETCH_MIN_PER_HOST_INTERVAL }}
+          FETCH_TIMEOUT: ${{ env.FETCH_TIMEOUT }}
+          FETCH_MAX_BYTES: ${{ env.FETCH_MAX_BYTES }}
+        run: |
+          set -euo pipefail
+          # Run fetcher as a module so relative imports (from scripts import cache_utils) work
+          python3 -m scripts.fetch_sources \
+            --workdir "$PWD" \
+            --cache "${CACHE_PATH}" \
+            --out "${RAW_OUT}" \
+            --concurrency "${FETCH_CONCURRENCY}" \
+            --per-host "${FETCH_PER_HOST}" \
+            --min-per-host-interval "${FETCH_MIN_PER_HOST_INTERVAL}" \
+            --timeout "${FETCH_TIMEOUT}" \
+            --max-bytes "${FETCH_MAX_BYTES}"
+
+      # -----------------------------
+      # 7) Merge & classify (hosts-first canonical)
+      # -----------------------------
+      - name: Merge & classify (hosts-first)
+        env:
+          RAW_OUT: ${{ env.RAW_OUT }}
+          MERGED_OUT: ${{ env.MERGED_OUT }}
+        run: |
+          set -euo pipefail
+          python3 scripts/merge-and-classify.py --raw "${RAW_OUT}" --out "${MERGED_OUT}" --stats "${MERGED_OUT}.stats.json"
+
+      # -----------------------------
+      # 8) Compute TOTAL_RULES and export to $GITHUB_ENV
+      # -----------------------------
+      - name: Compute TOTAL_RULES and export
+        id: totals
+        env:
+          MERGED_OUT: ${{ env.MERGED_OUT }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${MERGED_OUT:-}" ] || [ ! -f "${MERGED_OUT}" ]; then
+            COUNT=0
+          else
+            # Count non-empty lines that do NOT start (optionally) with # or !
+            COUNT=$(awk '{
+              if ($0 ~ /^[[:space:]]*$/) next
+              if ($0 ~ /^[[:space:]]*[#!]/) next
+              c++
+            } END { print (c+0) }' "${MERGED_OUT}")
+          fi
+
+          echo "TOTAL_RULES=${COUNT}" >> $GITHUB_ENV
+          echo "Computed TOTAL_RULES=${COUNT}"
+
+      # -----------------------------
+      # 9) Create or update a release `merged-latest` and upload merged.txt as asset
+      #    The release body contains exactly: "Total rules: <N>"
+      # -----------------------------
+      - name: Create or update Release and upload merged.txt (softprops)
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: merged-latest
+          name: merged-latest
+          body: "Total rules: ${{ env.TOTAL_RULES }}"
+          files: ${{ env.MERGED_OUT }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------
+      # 10) Final logging & sanity output
+      # -----------------------------
+      - name: Summary & final checks
+        run: |
+          echo "=== Summary ==="
+          echo "Merged file: ${{ env.MERGED_OUT }}"
+          echo "Total rules (computed): ${{ env.TOTAL_RULES }}"
+          # show only the top-line stats JSON keys if you want, but keep output small:
+          if [ -f "${{ env.MERGED_OUT }}.stats.json" ]; then
+            # print only these two keys as a one-liner (kept_rules and dropped_rules)
+            jq -r '{kept_rules, dropped_rules} | to_entries | .[] | "\(.key): \(.value)"' "${{ env.MERGED_OUT }}.stats.json" 2>/dev/null || true
+          fi

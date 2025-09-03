@@ -36,7 +36,7 @@ jobs:
       # 1) Checkout repository
       # -----------------------------
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           # full history so create-release / branch operations behave predictably
           fetch-depth: 0

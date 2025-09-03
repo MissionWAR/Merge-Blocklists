@@ -169,7 +169,7 @@ jobs:
       #    The release body contains exactly: "Total rules: <N>"
       # -----------------------------
       - name: Create or update Release and upload merged.txt (softprops)
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: merged-latest
           name: merged-latest

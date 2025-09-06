@@ -23,8 +23,6 @@ https://adguardteam.github.io/HostlistsRegistry/assets/filter_54.txt
 https://adguardteam.github.io/HostlistsRegistry/assets/filter_55.txt
 https://adguardteam.github.io/HostlistsRegistry/assets/filter_56.txt
 https://adguardteam.github.io/HostlistsRegistry/assets/filter_59.txt
-https://adguardteam.github.io/HostlistsRegistry/assets/filter_61.txt
-https://adguardteam.github.io/HostlistsRegistry/assets/filter_63.txt
 https://raw.githubusercontent.com/jdlingyu/ad-wars/master/hosts
 https://raw.githubusercontent.com/anudeepND/blacklist/master/adservers.txt
 https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/doh-ips.txt

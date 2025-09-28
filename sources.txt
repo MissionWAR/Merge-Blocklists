@@ -62,6 +62,5 @@ https://divested.dev/hosts-domains-wildcards
 https://feodotracker.abuse.ch/downloads/ipblocklist.txt
 https://hostfiles.frogeye.fr/firstparty-trackers-hosts.txt
 https://hblock.molinero.dev/hosts_adblock.txt
-https://o0.pages.dev/Pro/adblock.txt
 https://badmojr.github.io/1Hosts/Xtra/adblock.txt
 https://adaway.org/hosts.txt

@@ -1,323 +1,439 @@
 #!/usr/bin/env python3
 """
-scripts/fetch_sources.py
+fetch_sources.py
 
-Fetch sources into cache and produce a concatenated raw output file.
+Asynchronous downloader for blocklist sources with built-in caching and retry logic.
 
-Key behaviors:
-- Defaults to sequential downloading (concurrency=1). Use --concurrency to enable
-  bounded parallelism.
-- Per-host concurrency and a per-host minimum interval prevent hammering single hosts.
-- Uses the cache utilities in scripts/cache_utils.py (ETag/If-Modified-Since support).
-- Optional --dry-run / --verify-only to only inspect cache without hitting network.
-- --verbose to enable debug logging.
-
-Example:
-  python3 -m scripts.fetch_sources --workdir . --cache output/cache --out output/_raw.txt
-  python3 -m scripts.fetch_sources --dry-run --cache output/cache
+Behavior:
+ - Uses aiohttp for concurrent downloads.
+ - Respects simple per-origin rate limiting (delay between requests to same origin).
+ - Supports conditional GET (If-None-Match / If-Modified-Since) using cached metadata.
+ - Falls back to cached file on failure or 304 Not Modified.
+ - Retries transient failures (network, 429, 5xx) with exponential backoff + jitter.
+ - Deduplicates fetched .txt files by content hash after completion.
+ - Writes structured JSON summary to cache directory.
 """
-
 from __future__ import annotations
 
 import argparse
-import logging
-import threading
+import asyncio
+import hashlib
+import json
+import random
+import shutil
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any
 from urllib.parse import urlparse
-import sys
 
-# make sure repo root is on sys.path so "from scripts import cache_utils" works
-_THIS_DIR = Path(__file__).resolve().parent
-_REPO_ROOT = _THIS_DIR.parent
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+import aiohttp
 
-from scripts import cache_utils  # local module with download_with_cache(), session_with_retries(), _key(), _read_meta_any
-
-# module logger
-logger = logging.getLogger("fetch_sources")
-if not logger.handlers:
-    h = logging.StreamHandler()
-    h.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
-    logger.addHandler(h)
-logger.setLevel(logging.INFO)
+from scripts import utils
+from scripts.cache_utils import CacheManager, atomic_write_text
 
 
-def set_log_level(verbose: bool) -> None:
-    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
-    cache_utils.set_log_level(verbose)
+# ----------------------------------------
+# Constants
+# ----------------------------------------
+IO_BUFFER_SIZE = utils.IO_BUFFER_SIZE  # Import shared buffer size for consistency
+CHUNK_SIZE = IO_BUFFER_SIZE  # Use same buffer size for network chunks
+PURGE_TOKENS = ("_clean", "_valid", ".part", ".bak", ".swp")
+
+# CI-safe defaults
+DEFAULT_CONCURRENCY = 8
+DEFAULT_TIMEOUT = 30
+DEFAULT_RETRIES = 3
+DEFAULT_PER_HOST_DELAY = 0.2  # seconds
 
 
-def read_sources_file(path: Path) -> List[str]:
-    """Return list of non-empty, non-comment lines from a sources file."""
-    text = path.read_text(encoding="utf-8", errors="replace")
-    lines = [ln.strip() for ln in text.splitlines()]
-    return [ln for ln in lines if ln and not ln.startswith("#") and not ln.startswith("!")]
+# ----------------------------------------
+# Helpers
+# ----------------------------------------
+def _get_origin(url: str) -> str:
+    """Return canonical origin (scheme://host[:port]) for rate limiting."""
+    p = urlparse(url)
+    scheme = p.scheme or "https"
+    host = p.hostname or ""
+    port = f":{p.port}" if p.port else ""
+    return f"{scheme}://{host}{port}"
 
 
-def _worker_download(
-    session,
+async def _wait_for_host_slot(
+    origin: str, host_last_times: dict[str, float], delay: float
+) -> None:
+    """Ensure at least `delay` seconds since last request to the same origin."""
+    now = time.time()
+    last = host_last_times.get(origin, 0.0)
+    wait = delay - (now - last)
+    if wait > 0:
+        await asyncio.sleep(wait)
+    # Caller updates host_last_times[origin] after actual request
+
+
+def _should_retry_status(status: int) -> bool:
+    """Return True if HTTP status is retryable."""
+    return status == 429 or 500 <= status < 600
+
+
+def compute_file_sha(path: Path) -> str:
+    """Compute SHA-256 of a file (used for deduplication)."""
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        while chunk := fh.read(CHUNK_SIZE):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# ----------------------------------------
+# Fetch single URL
+# ----------------------------------------
+async def fetch_one(
+    session: aiohttp.ClientSession,
     url: str,
-    cache_dir: str,
+    cache: CacheManager,
+    out_dir: Path,
     timeout: int,
-    host_semaphores: Dict[str, threading.Semaphore],
-    host_timestamps: Dict[str, float],
-    host_lock: threading.Lock,
-    min_per_host_interval: float,
-    per_host: int,
-    max_bytes: int,
-    dry_run: bool = False,
-) -> Tuple[bool, Optional[str], bool, Optional[str]]:
+    retries: int,
+    per_host_delay: float,
+) -> tuple[str, str, str]:
     """
-    Download a single URL into cache (or inspect cache if dry_run).
+    Fetch a single URL with conditional GET and retries.
 
-    Returns:
-      (ok, path_or_none, was_cached, error_or_none)
+    Returns tuple: (status, url, info)
+      status ∈ {"ok", "not-modified", "used-cache-on-fail", "failed"}
     """
-    parsed = urlparse(url)
-    host = parsed.hostname or url
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache.path_for_url(url)
+    dest_path = out_dir / cache_path.name
 
-    sem = host_semaphores.setdefault(host, threading.Semaphore(per_host))
-    acquired = sem.acquire(timeout=5)
-    if not acquired:
-        return False, None, False, "host-busy"
+    origin = _get_origin(url)
+    meta = cache.get_meta(url) or {}
+    cached_file = cache.get_cached_file(url)
+    etag, last_modified = meta.get("etag"), meta.get("last_modified")
 
+    # Track per-origin delay in session object
+    if not hasattr(session, "_host_last_times"):
+        session._host_last_times = {}  # type: ignore
+    host_last_times: dict[str, float] = session._host_last_times  # type: ignore
+
+    attempt = 0
+    last_exc: Exception | None = None
+
+    while attempt <= retries:
+        attempt += 1
+        try:
+            # Respect per-origin delay
+            await _wait_for_host_slot(origin, host_last_times, per_host_delay)
+
+            headers: dict[str, str] = {
+                "User-Agent": "Mozilla/5.0 (compatible; MergeBlocklists/1.0; +https://github.com/filterlists-aggregator)"
+            }
+            if etag:
+                headers["If-None-Match"] = etag
+            if last_modified:
+                headers["If-Modified-Since"] = last_modified
+
+            timeout_obj = aiohttp.ClientTimeout(total=timeout)
+            async with session.get(url, headers=headers, timeout=timeout_obj) as resp:
+                # update last request time for origin
+                host_last_times[origin] = time.time()
+
+                # 304: not modified, re-use cached copy
+                if resp.status == 304:
+                    if cached_file and cached_file.exists():
+                        # refresh metadata from response headers if present
+                        resp_etag = resp.headers.get("ETag") or etag
+                        resp_last_modified = (
+                            resp.headers.get("Last-Modified") or last_modified
+                        )
+                        # Reuse existing SHA from metadata (file hasn't changed)
+                        content_sha = meta.get("content_sha256")
+                        cache.record_fetch(
+                            url,
+                            cached_file,
+                            etag=resp_etag,
+                            last_modified=resp_last_modified,
+                            content_sha256=content_sha,
+                            status_code=resp.status,
+                        )
+                        shutil.copy2(cached_file, dest_path)
+                        return "not-modified", url, str(dest_path)
+                    last_exc = Exception("304 received but no cached copy available")
+                    raise last_exc
+
+                # Non-200: handle retryable or final failure
+                if resp.status != 200:
+                    if _should_retry_status(resp.status):
+                        last_exc = Exception(f"HTTP {resp.status}")
+                        raise last_exc
+                    last_exc = Exception(f"HTTP {resp.status}")
+                    break
+
+                # 200 OK: stream download to temp file + compute SHA
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = cache_path.with_suffix(".part")
+                hasher = hashlib.sha256()
+                with tmp.open("wb") as fh:
+                    async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
+                        if not chunk:
+                            continue
+                        fh.write(chunk)
+                        hasher.update(chunk)
+
+                # atomic replace cached file
+                tmp.replace(cache_path)
+
+                resp_etag = resp.headers.get("ETag")
+                resp_last_modified = resp.headers.get("Last-Modified")
+                content_sha = hasher.hexdigest()
+
+                cache.record_fetch(
+                    url,
+                    cache_path,
+                    etag=resp_etag,
+                    last_modified=resp_last_modified,
+                    content_sha256=content_sha,
+                    status_code=resp.status,
+                )
+
+                shutil.copy2(cache_path, dest_path)
+                return "ok", url, str(dest_path)
+
+        except Exception as ex:
+            last_exc = ex
+            if attempt <= retries:
+                base = 0.5 * (2 ** (attempt - 1))
+                jitter = random.uniform(0, base * 0.1)
+                await asyncio.sleep(min(base + jitter, 10.0))
+                continue
+            break
+
+    # After all retries fail: fallback to cached file
+    cached = cache.get_cached_file(url)
+    if cached and cached.exists():
+        try:
+            shutil.copy2(cached, dest_path)
+            return "used-cache-on-fail", url, str(dest_path)
+        except Exception as ex:
+            return "failed", url, f"fallback copy error: {ex}"
+    return "failed", url, f"failed: {last_exc}"
+
+
+# ----------------------------------------
+# Fetch all URLs concurrently
+# ----------------------------------------
+async def fetch_all(
+    urls: list[str],
+    out_dir: Path,
+    cache_dir: Path,
+    concurrency: int,
+    timeout: int,
+    retries: int,
+    per_host_delay: float,
+) -> dict[str, Any]:
+    """Fetch all sources concurrently and summarize results."""
+    cache = CacheManager(cache_dir)
+    results: dict[str, int] = {
+        "ok": 0,
+        "not-modified": 0,
+        "used-cache-on-fail": 0,
+        "failed": 0,
+        "processed": 0,
+    }
+    failed_urls: list[tuple[str, str]] = []  # Track failed URLs with reasons
+
+    connector = aiohttp.TCPConnector(limit=concurrency)
+    sem = asyncio.Semaphore(concurrency)
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [
+            asyncio.create_task(
+                _fetch_with_limit(
+                    session, sem, url, cache, out_dir, timeout, retries, per_host_delay
+                )
+            )
+            for url in urls
+        ]
+
+        for coro in asyncio.as_completed(tasks):
+            status, url, info = await coro
+            results["processed"] += 1
+            results[status] = results.get(status, 0) + 1
+            
+            # Only log failures (reduce log noise)
+            if status == "failed":
+                failed_urls.append((url, info))
+                print(f"❌ [FAILED] {url} -> {info}")
+
+    # Write summary JSON into cache dir
+    summary = {"summary": results, "timestamp": int(time.time())}
     try:
-        # Enforce min interval between hits to same host
-        with host_lock:
-            last_ts = host_timestamps.get(host, 0.0)
-            now = time.time()
-            wait = 0.0
-            if min_per_host_interval and (now - last_ts) < min_per_host_interval:
-                wait = min_per_host_interval - (now - last_ts)
-        if wait:
-            logger.debug("Waiting %.2fs before contacting host %s", wait, host)
-            time.sleep(wait)
+        atomic_write_text(
+            Path(cache_dir) / "fetch_summary.json",
+            json.dumps(summary, indent=2, ensure_ascii=False),
+        )
+    except Exception:
+        pass
 
-        key = cache_utils._key(url)
-        content_path = Path(cache_dir) / f"{key}.dat"
-        meta_path = Path(cache_dir) / f"{key}.meta.json"
+    # Post-cleanup (non-fatal)
+    try:
+        purge_processed_like_files(out_dir)
+        dedupe_outdir_by_content(out_dir)
+    except Exception as e:
+        import sys
+        print(f"Warning: Post-cleanup failed: {e}", file=sys.stderr)
 
-        # Dry-run simply checks cache presence
-        if dry_run:
-            cached_exists = content_path.exists()
-            return True, str(content_path) if cached_exists else None, cached_exists, None
+    return {
+        "results": results,
+        "failed_urls": failed_urls,
+        "cache_dir": str(cache_dir),
+        "out_dir": str(out_dir),
+    }
 
-        # If cache missing and max_bytes is set, optionally HEAD-check to skip large files
-        need_head_check = not content_path.exists() and bool(max_bytes and max_bytes > 0)
-        if need_head_check and hasattr(session, "head"):
+
+async def _fetch_with_limit(
+    session: aiohttp.ClientSession,
+    sem: asyncio.Semaphore,
+    url: str,
+    cache: CacheManager,
+    out_dir: Path,
+    timeout: int,
+    retries: int,
+    per_host_delay: float,
+) -> tuple[str, str, str]:
+    """Run fetch_one() under concurrency semaphore."""
+    async with sem:
+        return await fetch_one(
+            session, url, cache, out_dir, timeout, retries, per_host_delay
+        )
+
+
+# ----------------------------------------
+# Post-processing
+# ----------------------------------------
+def purge_processed_like_files(out_dir: Path) -> None:
+    """Delete leftover temporary or auxiliary files."""
+    out_dir_path = Path(out_dir)
+    if not out_dir_path.exists():
+        return
+    for p in out_dir_path.iterdir():
+        if p.is_file() and any(tok in p.name.lower() for tok in PURGE_TOKENS):
             try:
-                logger.debug("HEAD %s", url)
-                resp_head = session.head(url, allow_redirects=True, timeout=min(10, timeout))
-                cl = resp_head.headers.get("Content-Length")
-                if cl and int(cl) > max_bytes:
-                    return False, None, False, f"too-large:{cl}"
-            except Exception as exc:
-                logger.debug("HEAD failed for %s: %s", url, exc)
-
-        # Read old meta (if any) for hit detection
-        try:
-            old_meta = cache_utils._read_meta_any(meta_path)
-        except Exception:
-            old_meta = {}
-
-        ok, path_or_err = cache_utils.download_with_cache(session, url, cache_dir, timeout=timeout)
-
-        # Update host timestamp
-        with host_lock:
-            host_timestamps[host] = time.time()
-
-        if not ok:
-            return False, None, False, path_or_err
-
-        # Read new meta and decide if this was a cached hit
-        try:
-            new_meta = cache_utils._read_meta_any(meta_path)
-        except Exception:
-            new_meta = {}
-
-        was_cached = False
-        # If both have fetched_at and they are the same, consider it cached (server returned 304)
-        if old_meta and new_meta and old_meta.get("fetched_at") and new_meta.get("fetched_at"):
-            if old_meta.get("fetched_at") == new_meta.get("fetched_at"):
-                was_cached = True
-        else:
-            # If no meta, but content existed prior to call, guess cached hit (best-effort)
-            if content_path.exists() and old_meta:
-                was_cached = True
-
-        return True, path_or_err, was_cached, None
-    finally:
-        sem.release()
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
-def _mirror_and_collect(raw_parts_dir: Path, content_path: Path, out_lines: List[str]) -> None:
-    """
-    Copy content to raw_parts for provenance and append non-comment lines into out_lines.
-    Best-effort: failures here don't abort the run.
-    """
-    raw_parts_dir.mkdir(parents=True, exist_ok=True)
-    target = raw_parts_dir / content_path.name
-    try:
-        data = content_path.read_text(encoding="utf-8", errors="replace")
-        target.write_text(data, encoding="utf-8")
-    except Exception as exc:
-        logger.debug("Mirror failed for %s -> %s: %s", content_path, target, exc)
+def dedupe_outdir_by_content(out_dir: Path) -> None:
+    """Deduplicate .txt files in output directory by SHA-256 hash."""
+    out_dir_path = Path(out_dir)
+    if not out_dir_path.exists():
+        return
+    files = [p for p in out_dir_path.iterdir() if p.is_file() and p.suffix == ".txt"]
+    if len(files) <= 1:
         return
 
-    for ln in data.splitlines():
-        s = ln.strip()
-        if not s or s.startswith("#") or s.startswith("!"):
+    # Group by file size to minimize hashing
+    size_map: dict[int, list[Path]] = {}
+    for p in files:
+        try:
+            size_map.setdefault(p.stat().st_size, []).append(p)
+        except Exception:
             continue
-        out_lines.append(ln)
 
-
-def main(argv: Optional[List[str]] = None) -> int:
-    p = argparse.ArgumentParser(description="Fetch sources into cache and produce concatenated raw output.")
-    p.add_argument("--workdir", default=".", help="Repository root (where sources.txt lives)")
-    p.add_argument("--sources", default="sources.txt", help="Sources file path (relative to workdir)")
-    p.add_argument("--cache", default="output/cache", help="Cache directory")
-    p.add_argument("--raw-parts", default="output/raw_parts", help="Directory to mirror raw downloaded parts")
-    p.add_argument("--out", default="output/_raw.txt", help="Concatenated output file")
-    p.add_argument("--concurrency", type=int, default=1, help="Total workers (1 = sequential)")
-    p.add_argument("--per-host", type=int, default=2, help="Max concurrent requests per hostname")
-    p.add_argument("--min-per-host-interval", type=float, default=0.5, help="Min seconds between requests to same host")
-    p.add_argument("--timeout", type=int, default=30, help="Per-request timeout (seconds)")
-    p.add_argument("--max-bytes", type=int, default=0, help="Skip downloads whose Content-Length exceeds this size (0=disabled)")
-    p.add_argument("--dry-run", action="store_true", help="Do not perform network requests; only report cache hits")
-    p.add_argument("--verify-only", action="store_true", help="Alias for --dry-run")
-    p.add_argument("--verbose", action="store_true", help="Enable debug logging (verbose)")
-    args = p.parse_args(argv)
-
-    set_log_level(args.verbose)
-
-    workdir = Path(args.workdir)
-    sources_path = (workdir / args.sources).resolve()
-    cache_dir = (workdir / args.cache).resolve()
-    raw_parts_dir = (workdir / args.raw_parts).resolve()
-    out_path = (workdir / args.out).resolve()
-
-    if not sources_path.exists():
-        logger.error("Sources file not found: %s", sources_path)
-        return 1
-
-    urls = read_sources_file(sources_path)
-    if not urls:
-        logger.info("No sources to process.")
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text("", encoding="utf-8")
-        return 0
-
-    # session only when not dry-run
-    session = None
-    if not (args.dry_run or args.verify_only):
-        session = cache_utils.session_with_retries()
-
-    host_semaphores: Dict[str, threading.Semaphore] = {}
-    host_timestamps: Dict[str, float] = {}
-    host_lock = threading.Lock()
-
-    out_lines: List[str] = []
-    failures: List[Tuple[str, str]] = []
-    cached_hits = 0
-    downloads = 0
-    total = len(urls)
-
-    # sequential or threaded execution
-    if args.concurrency <= 1:
-        for url in urls:
-            ok, path_or_err, was_cached, err = _worker_download(
-                session,
-                url,
-                str(cache_dir),
-                args.timeout,
-                host_semaphores,
-                host_timestamps,
-                host_lock,
-                args.min_per_host_interval,
-                args.per_host,
-                args.max_bytes,
-                dry_run=(args.dry_run or args.verify_only),
-            )
-            if not ok:
-                failures.append((url, err or "unknown"))
+    sha_map: dict[str, list[Path]] = {}
+    for group in size_map.values():
+        for p in group:
+            try:
+                sha = compute_file_sha(p)
+                sha_map.setdefault(sha, []).append(p)
+            except Exception:
                 continue
-            if path_or_err:
-                if was_cached:
-                    cached_hits += 1
-                else:
-                    downloads += 1
-                try:
-                    _mirror_and_collect(raw_parts_dir, Path(path_or_err), out_lines)
-                except Exception as exc:
-                    logger.debug("mirror error for %s: %s", path_or_err, exc)
-            else:
-                logger.info("No cached file for %s (dry-run)", url)
-    else:
-        with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
-            fut_to_url = {}
-            for url in urls:
-                fut = ex.submit(
-                    _worker_download,
-                    session,
-                    url,
-                    str(cache_dir),
-                    args.timeout,
-                    host_semaphores,
-                    host_timestamps,
-                    host_lock,
-                    args.min_per_host_interval,
-                    args.per_host,
-                    args.max_bytes,
-                    args.dry_run or args.verify_only,
-                )
-                fut_to_url[fut] = url
-            for fut in as_completed(fut_to_url):
-                url = fut_to_url[fut]
-                try:
-                    ok, path_or_err, was_cached, err = fut.result()
-                except Exception as exc:
-                    failures.append((url, f"exception: {exc}"))
-                    continue
-                if not ok:
-                    failures.append((url, err or "unknown"))
-                    continue
-                if path_or_err:
-                    if was_cached:
-                        cached_hits += 1
-                    else:
-                        downloads += 1
-                    try:
-                        _mirror_and_collect(raw_parts_dir, Path(path_or_err), out_lines)
-                    except Exception as exc:
-                        logger.debug("mirror error for %s: %s", path_or_err, exc)
-                else:
-                    logger.info("No cached file for %s (dry-run)", url)
 
-    # write final concatenated output (non-empty, non-comment lines)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    final_text = "\n".join(out_lines).rstrip() + "\n"
-    out_path.write_text(final_text, encoding="utf-8")
+    for paths in sha_map.values():
+        if len(paths) <= 1:
+            continue
+        keeper = sorted(paths, key=lambda p: (len(p.name), p.name))[0]
+        for p in paths:
+            if p != keeper:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
-    succeeded = cached_hits + downloads
-    logger.info(
-        "Fetch summary: sources=%d, succeeded=%d, cached_hits=%d, downloads=%d, failures=%d",
-        total,
-        succeeded,
-        cached_hits,
-        downloads,
-        len(failures),
+
+# ----------------------------------------
+# CLI
+# ----------------------------------------
+def main() -> None:
+    """CLI entrypoint for async source fetching."""
+    parser = argparse.ArgumentParser(
+        description="Fetch blocklist sources (async, with cache fallback)"
     )
-    if failures:
-        logger.info("Failed (sample):")
-        for u, err in failures[:20]:
-            logger.info("- %s -> %s", u, err)
+    parser.add_argument(
+        "-s", "--sources", default="sources.txt", help="File with source URLs"
+    )
+    parser.add_argument("-o", "--outdir", default="lists/_raw", help="Output directory")
+    parser.add_argument("-c", "--cache", default=".cache", help="Cache directory")
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=DEFAULT_CONCURRENCY,
+        help="Max concurrent fetches",
+    )
+    parser.add_argument(
+        "--retries", type=int, default=DEFAULT_RETRIES, help="Retries per URL"
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=DEFAULT_TIMEOUT, help="Request timeout (seconds)"
+    )
+    parser.add_argument(
+        "--per-host-delay",
+        type=float,
+        default=DEFAULT_PER_HOST_DELAY,
+        help="Delay between requests to same host (seconds)",
+    )
+    args = parser.parse_args()
 
-    return 0
+    src = Path(args.sources)
+    if not src.exists():
+        raise SystemExit(f"Sources file not found: {src}")
+    with src.open("r", encoding="utf-8") as fh:
+        urls = [
+            line.strip() for line in fh if line.strip() and not line.startswith("#")
+        ]
+
+    out_dir = Path(args.outdir)
+    cache_dir = Path(args.cache)
+
+    info = asyncio.run(
+        fetch_all(
+            urls,
+            out_dir,
+            cache_dir,
+            args.concurrency,
+            args.timeout,
+            args.retries,
+            args.per_host_delay,
+        )
+    )
+    res = info["results"]
+    failed_urls = info.get("failed_urls", [])
+
+    print("fetch_sources: finished")
+    print(f"  processed:           {res['processed']}")
+    print(f"    ok:                {res['ok']}")
+    print(f"    not-modified:      {res.get('not-modified', 0)}")
+    print(f"    used-cache-on-fail:{res['used-cache-on-fail']}")
+    print(f"    failed:            {res['failed']}")
+    
+    # Show failed URLs if any
+    if failed_urls:
+        print("\n⚠️  Failed URLs:")
+        for url, reason in failed_urls:
+            print(f"  - {url}")
+            print(f"    Reason: {reason}")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

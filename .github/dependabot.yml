@@ -1,16 +1,12 @@
 version: 2
 updates:
-  # keep GitHub Actions action versions up-to-date
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "monthly"
-
-  # keep Python dependencies (pip / poetry / pipenv) up-to-date
-  - package-ecosystem: "pip"
-    directory: "/"          # repo root (adjust if your requirements live elsewhere)
-    schedule:
       interval: "weekly"
-    open-pull-requests-limit: 5
-    # optional: set `target-branch` if you'd like Dependabot PRs to target a different branch
-    # target-branch: "dependencies"

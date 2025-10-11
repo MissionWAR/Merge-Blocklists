@@ -61,8 +61,11 @@ def atomic_write_text(target: Path, text: str, encoding: str = "utf-8") -> None:
         tmp_path = Path(tmp.name)
     try:
         tmp_path.replace(target)
-    finally:
-        tmp_path.unlink(missing_ok=True)
+    except Exception:
+        # Only unlink if replace failed (file still exists)
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+        raise
 
 
 # ----------------------------------------
@@ -82,12 +85,16 @@ class CacheManager:
     # Metadata I/O
     # --------------------
     def _load(self) -> None:
-        """Load metadata file if available."""
+        """Load metadata file if available. Silently creates empty metadata on corruption."""
         if not self.meta_path.exists():
             return
         try:
-            self._meta = json.loads(self.meta_path.read_text(encoding="utf-8"))
-        except Exception:
+            content = self.meta_path.read_text(encoding="utf-8")
+            self._meta = json.loads(content)
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+            # Corrupted metadata - start fresh
+            import sys
+            print(f"Warning: Cache metadata corrupted ({type(e).__name__}), starting fresh", file=sys.stderr)
             self._meta = {}
 
     def save(self) -> None:
@@ -98,9 +105,11 @@ class CacheManager:
                 json.dumps(self._meta, indent=2, sort_keys=True, ensure_ascii=False)
                 + "\n",
             )
-        except Exception:
+        except Exception as e:
             # best-effort; cache persistence should not fail the pipeline
-            pass
+            # but log for debugging
+            import sys
+            print(f"Warning: Failed to save cache metadata: {e}", file=sys.stderr)
 
     # --------------------
     # Public API
@@ -130,7 +139,6 @@ class CacheManager:
             "etag": etag,
             "last_modified": last_modified,
             "content_sha256": content_sha256,
-            "fetched_at": now,
             "status_code": status_code,
         }
         self._meta[url] = meta
@@ -147,9 +155,11 @@ class CacheManager:
             p = self.path_for_url(url)
             return p if p.exists() else None
 
-        recorded = Path(meta.get("path", ""))
-        if recorded.exists():
-            return recorded
+        recorded_path = meta.get("path", "")
+        if recorded_path:
+            recorded = Path(recorded_path)
+            if recorded.exists():
+                return recorded
 
         fallback = self.path_for_url(url)
         return fallback if fallback.exists() else None

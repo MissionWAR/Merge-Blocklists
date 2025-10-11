@@ -1,193 +1,211 @@
-name: Update blocklists (fetch → merge → release)
+name: Merge Blocklists
 
-# Triggers: scheduled twice daily, manual dispatch, and when sources.txt changes
 on:
+  workflow_dispatch:
   schedule:
-    - cron: "0 2 * * *"   # 02:00 UTC daily
-    - cron: "0 14 * * *"  # 14:00 UTC daily
-  workflow_dispatch: {}    # allow manual runs
-  push:
-    paths:
-      - "sources.txt"
+    - cron: "0 */12 * * *"   # Every 12 hours (00:00, 12:00 UTC)
 
-# We need write access so the workflow can create/update releases and upload assets
+env:
+  RAW_OUT: lists/_raw
+  MERGED_OUT: lists/merged.txt
+  FETCH_CONCURRENCY: 8
+  FETCH_RETRIES: 3
+  FETCH_TIMEOUT: 30
+  PYTHON_VERSION: "3.11"
+
 permissions:
   contents: write
 
 jobs:
-  build-and-publish:
-    name: Fetch, merge, and publish merged-latest
+  update:
     runs-on: ubuntu-latest
-
-    # Conservative defaults — tweak these environment variables if you want to change behavior.
-    env:
-      FETCH_CONCURRENCY: 1             # 1 = sequential; raise to enable parallel downloads
-      FETCH_PER_HOST: 2               # max concurrent requests to the same hostname
-      FETCH_MIN_PER_HOST_INTERVAL: 0.5 # seconds between requests to same host
-      FETCH_TIMEOUT: 30               # per-request timeout seconds
-      FETCH_MAX_BYTES: 0              # 0 = disabled; >0 will skip very large downloads
-      CACHE_DIR: output/cache
-      RAW_OUT: output/_raw.txt
-      MERGED_OUT: output/merged.txt
+    timeout-minutes: 30
 
     steps:
-
-      # -----------------------------
-      # 1) Checkout repository
-      # -----------------------------
+      # ============================================
+      # Setup
+      # ============================================
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
         with:
-          # full history so create-release / branch operations behave predictably
-          fetch-depth: 0
-          persist-credentials: true
+          fetch-depth: 1  # Shallow clone for faster checkout
 
-      # -----------------------------
-      # 2) Setup Python
-      # -----------------------------
-      - name: Setup Python 3.x
-        uses: actions/setup-python@v6
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
 
-      # -----------------------------
-      # 3) Restore pip cache (optional)
-      # -----------------------------
-      - name: Restore pip cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          # matrix variables are not present in this workflow; use a stable key
-          key: pip-${{ runner.os }}-py-${{ hashFiles('**/pyproject.toml','**/requirements*.txt') }}
-          restore-keys: |
-            pip-${{ runner.os }}-py-
-
-      - name: Install lightweight runtime deps
-        # keep installs minimal — scripts only require 'requests' and stdlib
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install --disable-pip-version-check requests
+          pip install --no-cache-dir -r requirements.txt
+          echo "✅ Dependencies installed"
 
-      # -----------------------------
-      # 4) Restore previously cached downloaded lists (output/cache)
-      # -----------------------------
-      - name: Restore HTTP cache (output/cache)
+      # ============================================
+      # Caching
+      # ============================================
+      - name: Restore blocklist cache
         uses: actions/cache@v4
         with:
-          # key is derived from sources.txt contents so changing sources causes a new key
-          path: ${{ env.CACHE_DIR }}
-          key: fetch-cache-${{ runner.os }}-${{ hashFiles('sources.txt') }}
+          path: .cache
+          key: blocklists-cache-${{ hashFiles('sources.txt') }}-${{ github.run_id }}
           restore-keys: |
-            fetch-cache-${{ runner.os }}-
+            blocklists-cache-${{ hashFiles('sources.txt') }}-
+            blocklists-cache-
 
-      # Note: actions/cache will attempt to upload the cache at the end of the job if
-      # the key was not found (i.e. on cache-miss). You don't need an explicit "save" step.
-
-      # -----------------------------
-      # 5) Compact cache debug (keeps logs small)
-      # -----------------------------
-      - name: Show cache (compact)
-        if: ${{ always() }}
+      # ============================================
+      # Fetch & Process
+      # ============================================
+      - name: Fetch blocklist sources
+        id: fetch
         run: |
-          echo "cache path: ${{ env.CACHE_DIR }}"
-          if [ -d "${{ env.CACHE_DIR }}" ]; then
-            echo "dat files: $(ls -1 ${{ env.CACHE_DIR }}/*.dat 2>/dev/null | wc -l)"
-            echo "meta.json files: $(ls -1 ${{ env.CACHE_DIR }}/*.meta.json 2>/dev/null | wc -l)"
-            # show a tiny example (first meta) so logs are useful but bounded
-            if ls ${{ env.CACHE_DIR }}/*.meta.json >/dev/null 2>&1; then
-              FIRST_META=$(ls ${{ env.CACHE_DIR }}/*.meta.json | head -n1)
-              echo "example meta (first 80 chars):"
-              head -c 80 "$FIRST_META" || true
-              echo "..."
-            fi
-          else
-            echo "no cache directory present"
+          set -euo pipefail
+          echo "🔄 Fetching blocklists from sources..."
+          
+          python -m scripts.fetch_sources \
+            --sources sources.txt \
+            --outdir "${{ env.RAW_OUT }}" \
+            --cache .cache \
+            --concurrency "${{ env.FETCH_CONCURRENCY }}" \
+            --retries "${{ env.FETCH_RETRIES }}" \
+            --timeout "${{ env.FETCH_TIMEOUT }}"
+          
+          # Count fetched files
+          RAW_COUNT=$(find "${{ env.RAW_OUT }}" -type f -name "*.txt" | wc -l)
+          echo "raw_files=$RAW_COUNT" >> $GITHUB_OUTPUT
+          echo "✅ Fetched $RAW_COUNT source files"
+
+      - name: Process blocklists through pipeline
+        id: pipeline
+        run: |
+          set -euo pipefail
+          echo "⚙️ Processing through pipeline..."
+          
+          # Run the full pipeline
+          python -m scripts.pipeline "${{ env.RAW_OUT }}" "${{ env.MERGED_OUT }}"
+          
+          # Verify output exists
+          if [ ! -f "${{ env.MERGED_OUT }}" ]; then
+            echo "❌ ERROR: Merged output file not created"
+            exit 1
           fi
+          
+          echo "✅ Pipeline completed successfully"
 
-      # -----------------------------
-      # 6) Fetch sources (uses scripts/fetch_sources.py)
-      # -----------------------------
-      - name: Fetch sources
-        env:
-          CACHE_PATH: ${{ env.CACHE_DIR }}
-          RAW_OUT: ${{ env.RAW_OUT }}
-          FETCH_CONCURRENCY: ${{ env.FETCH_CONCURRENCY }}
-          FETCH_PER_HOST: ${{ env.FETCH_PER_HOST }}
-          FETCH_MIN_PER_HOST_INTERVAL: ${{ env.FETCH_MIN_PER_HOST_INTERVAL }}
-          FETCH_TIMEOUT: ${{ env.FETCH_TIMEOUT }}
-          FETCH_MAX_BYTES: ${{ env.FETCH_MAX_BYTES }}
+      - name: Calculate statistics
+        id: stats
         run: |
           set -euo pipefail
-          # Run fetcher as a module so relative imports (from scripts import cache_utils) work
-          python3 -m scripts.fetch_sources \
-            --workdir "$PWD" \
-            --cache "${CACHE_PATH}" \
-            --out "${RAW_OUT}" \
-            --concurrency "${FETCH_CONCURRENCY}" \
-            --per-host "${FETCH_PER_HOST}" \
-            --min-per-host-interval "${FETCH_MIN_PER_HOST_INTERVAL}" \
-            --timeout "${FETCH_TIMEOUT}" \
-            --max-bytes "${FETCH_MAX_BYTES}"
+          
+          # Count total rules (non-comment, non-empty lines)
+          TOTAL_RULES=$(grep -cvE '^\s*($|[#!])' "${{ env.MERGED_OUT }}" || echo "0")
+          
+          # Get file size
+          FILE_SIZE=$(du -h "${{ env.MERGED_OUT }}" | cut -f1)
+          
+          # Count cache entries
+          CACHE_FILES=$(find .cache -type f -name "*.txt" 2>/dev/null | wc -l || echo "0")
+          
+          # Output to step outputs and environment
+          echo "total_rules=$TOTAL_RULES" >> $GITHUB_OUTPUT
+          echo "file_size=$FILE_SIZE" >> $GITHUB_OUTPUT
+          echo "TOTAL_RULES=$TOTAL_RULES" >> $GITHUB_ENV
+          
+          echo "📊 Statistics:"
+          echo "  - Total rules: $TOTAL_RULES"
+          echo "  - File size: $FILE_SIZE"
+          echo "  - Cached sources: $CACHE_FILES"
 
-      # -----------------------------
-      # 7) Merge & classify (hosts-first canonical)
-      # -----------------------------
-      - name: Merge & classify (hosts-first)
-        env:
-          RAW_OUT: ${{ env.RAW_OUT }}
-          MERGED_OUT: ${{ env.MERGED_OUT }}
+      # ============================================
+      # Validation
+      # ============================================
+      - name: Validate output
         run: |
           set -euo pipefail
-          python3 scripts/merge-and-classify.py --raw "${RAW_OUT}" --out "${MERGED_OUT}" --stats "${MERGED_OUT}.stats.json"
-
-      # -----------------------------
-      # 8) Compute TOTAL_RULES and export to $GITHUB_ENV
-      # -----------------------------
-      - name: Compute TOTAL_RULES and export
-        id: totals
-        env:
-          MERGED_OUT: ${{ env.MERGED_OUT }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "${MERGED_OUT:-}" ] || [ ! -f "${MERGED_OUT}" ]; then
-            COUNT=0
-          else
-            # Count non-empty lines that do NOT start (optionally) with # or !
-            COUNT=$(awk '{
-              if ($0 ~ /^[[:space:]]*$/) next
-              if ($0 ~ /^[[:space:]]*[#!]/) next
-              c++
-            } END { print (c+0) }' "${MERGED_OUT}")
+          
+          # Check minimum rule count (prevent empty releases)
+          MIN_RULES=1000
+          if [ "${{ steps.stats.outputs.total_rules }}" -lt "$MIN_RULES" ]; then
+            echo "⚠️ WARNING: Only ${{ steps.stats.outputs.total_rules }} rules (expected >$MIN_RULES)"
+            echo "This might indicate a fetch/processing issue"
+            exit 1
           fi
+          
+          echo "✅ Output validated (${{ steps.stats.outputs.total_rules }} rules)"
 
-          echo "TOTAL_RULES=${COUNT}" >> $GITHUB_ENV
-          echo "Computed TOTAL_RULES=${COUNT}"
+      # ============================================
+      # Release
+      # ============================================
+      - name: Generate release notes
+        id: release_notes
+        if: steps.stats.outputs.total_rules != '0'
+        run: |
+          cat > release_notes.md << EOF
+          ## Merged Blocklist
+          
+          **Updated**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          
+          ### Statistics
+          - **Total Rules**: ${{ steps.stats.outputs.total_rules }}
+          - **File Size**: ${{ steps.stats.outputs.file_size }}
+          - **Sources Processed**: ${{ steps.fetch.outputs.raw_files }}
+          EOF
+          
+          echo "✅ Release notes generated"
 
-      # -----------------------------
-      # 9) Create or update a release `merged-latest` and upload merged.txt as asset
-      #    The release body contains exactly: "Total rules: <N>"
-      # -----------------------------
-      - name: Create or update Release and upload merged.txt (softprops)
+      - name: Create or update release
+        if: steps.stats.outputs.total_rules != '0'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: merged-latest
-          name: merged-latest
-          body: "Total rules: ${{ env.TOTAL_RULES }}"
+          name: Merged Blocklist (Latest)
+          body_path: release_notes.md
           files: ${{ env.MERGED_OUT }}
+          draft: false
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # -----------------------------
-      # 10) Final logging & sanity output
-      # -----------------------------
-      - name: Summary & final checks
+      # ============================================
+      # Cleanup & Summary
+      # ============================================
+      - name: Cleanup old cache entries
+        if: always()
         run: |
-          echo "=== Summary ==="
-          echo "Merged file: ${{ env.MERGED_OUT }}"
-          echo "Total rules (computed): ${{ env.TOTAL_RULES }}"
-          # show only the top-line stats JSON keys if you want, but keep output small:
-          if [ -f "${{ env.MERGED_OUT }}.stats.json" ]; then
-            # print only these two keys as a one-liner (kept_rules and dropped_rules)
-            jq -r '{kept_rules, dropped_rules} | to_entries | .[] | "\(.key): \(.value)"' "${{ env.MERGED_OUT }}.stats.json" 2>/dev/null || true
-          fi
+          echo "🧹 Cleaning up old cache entries (>7 days)..."
+          find .cache -type f -mtime +7 -delete 2>/dev/null || true
+          
+          # Clean up temporary files
+          rm -rf lists/_raw 2>/dev/null || true
+          
+          echo "✅ Cleanup completed"
+
+      - name: Generate job summary
+        if: always()
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          # 📋 Blocklist Update Summary
+          
+          ## Status
+          - **Workflow**: ${{ job.status }}
+          - **Duration**: ${{ steps.stats.conclusion == 'success' && '✅ Success' || '❌ Failed' }}
+          
+          ## Statistics
+          | Metric | Value |
+          |--------|-------|
+          | Total Rules | ${{ steps.stats.outputs.total_rules || 'N/A' }} |
+          | File Size | ${{ steps.stats.outputs.file_size || 'N/A' }} |
+          | Sources Fetched | ${{ steps.fetch.outputs.raw_files || 'N/A' }} |
+          
+          ## Timestamps
+          - **Started**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          - **Run ID**: ${{ github.run_id }}
+          - **Commit**: \`${{ github.sha }}\`
+          
+          ## Next Update
+          Scheduled for: **12 hours from now**
+          EOF
+          
+          echo "✅ Job summary generated"

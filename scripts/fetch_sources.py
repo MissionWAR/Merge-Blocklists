@@ -133,8 +133,19 @@ async def fetch_one(
             if last_modified:
                 headers["If-Modified-Since"] = last_modified
 
-            timeout_obj = aiohttp.ClientTimeout(total=timeout)
-            async with session.get(url, headers=headers, timeout=timeout_obj) as resp:
+            # Set comprehensive timeout (connect, read, total)
+            timeout_obj = aiohttp.ClientTimeout(
+                total=timeout,
+                connect=10,  # 10s to establish connection
+                sock_read=timeout  # timeout for reading response
+            )
+            async with session.get(
+                url, 
+                headers=headers, 
+                timeout=timeout_obj,
+                allow_redirects=True,  # Follow redirects (max 10 by default)
+                max_redirects=10
+            ) as resp:
                 # update last request time for origin
                 host_last_times[origin] = time.time()
 
@@ -199,6 +210,26 @@ async def fetch_one(
                 shutil.copy2(cache_path, dest_path)
                 return "ok", url, str(dest_path)
 
+        except asyncio.TimeoutError:
+            last_exc = Exception("Timeout - server did not respond in time")
+            if attempt <= retries:
+                base = 0.5 * (2 ** (attempt - 1))
+                jitter = random.uniform(0, base * 0.1)
+                await asyncio.sleep(min(base + jitter, 10.0))
+                continue
+            break
+        except aiohttp.ClientConnectionError as ex:
+            last_exc = Exception(f"Connection error - {type(ex).__name__}")
+            if attempt <= retries:
+                base = 0.5 * (2 ** (attempt - 1))
+                jitter = random.uniform(0, base * 0.1)
+                await asyncio.sleep(min(base + jitter, 10.0))
+                continue
+            break
+        except aiohttp.ClientSSLError as ex:
+            last_exc = Exception(f"SSL certificate error - {ex}")
+            # SSL errors are usually not transient, don't retry
+            break
         except Exception as ex:
             last_exc = ex
             if attempt <= retries:
@@ -216,7 +247,9 @@ async def fetch_one(
             return "used-cache-on-fail", url, str(dest_path)
         except Exception as ex:
             return "failed", url, f"fallback copy error: {ex}"
-    return "failed", url, f"failed: {last_exc}"
+    # Provide detailed error message
+    error_msg = str(last_exc) if last_exc else "unknown error"
+    return "failed", url, error_msg
 
 
 # ----------------------------------------
@@ -242,7 +275,14 @@ async def fetch_all(
     }
     failed_urls: list[tuple[str, str]] = []  # Track failed URLs with reasons
 
-    connector = aiohttp.TCPConnector(limit=concurrency)
+    # Configure connector with better error handling
+    connector = aiohttp.TCPConnector(
+        limit=concurrency,
+        limit_per_host=5,  # Max 5 concurrent connections per host
+        ttl_dns_cache=300,  # Cache DNS for 5 minutes
+        force_close=False,  # Reuse connections
+        enable_cleanup_closed=True  # Clean up closed connections
+    )
     sem = asyncio.Semaphore(concurrency)
 
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -260,10 +300,9 @@ async def fetch_all(
             results["processed"] += 1
             results[status] = results.get(status, 0) + 1
             
-            # Only log failures (reduce log noise)
+            # Track failures for summary report (don't log immediately to avoid duplicates)
             if status == "failed":
                 failed_urls.append((url, info))
-                print(f"❌ [FAILED] {url} -> {info}")
 
     # Write summary JSON into cache dir
     summary = {"summary": results, "timestamp": int(time.time())}

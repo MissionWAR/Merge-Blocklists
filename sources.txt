@@ -73,7 +73,6 @@ https://hblock.molinero.dev/hosts_adblock.txt
 https://o0.pages.dev/Xtra/adblock.txt
 https://adaway.org/hosts.txt
 https://lists.cyberhost.uk/malware.txt
-https://www.usom.gov.tr/url-list.txt
 https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&mimetype=plaintext&useip=0.0.0.0
 https://hosts.tweedge.net/malicious.txt
 https://anti-ad.net/domains.txt

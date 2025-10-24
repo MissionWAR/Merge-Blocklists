@@ -33,6 +33,7 @@ import ipaddress
 import re
 import sys
 from functools import lru_cache
+from typing import Iterator
 
 
 # -------------------------
@@ -46,7 +47,7 @@ WILDCARD = "*"
 ELEMENT_HIDING_MARKERS = ("##", "#@#", "#%#")
 
 # Performance tuning constants
-DOMAIN_CACHE_SIZE = 8192  # LRU cache size for domain normalization
+DOMAIN_CACHE_SIZE = 32768  # LRU cache size for domain normalization (supports 5M+ domains)
 IO_BUFFER_SIZE = 131072  # 128KB buffer for file I/O (optimized for modern SSDs)
 
 _DOMAIN_REGEX = re.compile(
@@ -104,7 +105,7 @@ def contains_non_ascii_characters(s: str) -> bool:
     """Return True if string contains non-ASCII characters."""
     if not isinstance(s, str):
         s = str(s or "")
-    return not s.isascii()
+    return bool(_NON_ASCII_RE.search(s))
 
 
 def substring_between(s: str | None, start_tag: str, end_tag: str) -> str | None:
@@ -273,6 +274,32 @@ def canonicalize_ip(ip_raw: str) -> str | None:
         return str(ipaddress.ip_address(cand))
     except ValueError:
         return None
+
+
+# -------------------------
+# Domain suffix helpers
+# -------------------------
+
+
+def walk_suffixes(domain: str) -> Iterator[str]:
+    """
+    Yield domain and successive parent suffixes (e.g., a.b.c → a.b.c, b.c, c).
+    
+    Args:
+        domain: Domain string to walk
+        
+    Yields:
+        Domain and each parent suffix in order
+    """
+    if not domain:
+        return
+    cur = domain
+    yield cur
+    idx = cur.find(".")
+    while idx != -1:
+        cur = cur[idx + 1:]
+        yield cur
+        idx = cur.find(".")
 
 
 # -------------------------
@@ -452,6 +479,7 @@ def convert_non_ascii_to_punycode(line: str) -> str:
         return line
 
 
+@lru_cache(maxsize=8192)
 def is_just_domain(token: str) -> bool:
     """Return True if token is a syntactically valid domain (strict match)."""
     if not token:
@@ -503,6 +531,7 @@ __all__ = [
     "is_just_domain",
     "find_unescaped_char",
     "find_last_unescaped_dollar",
+    "walk_suffixes",
     # Constants
     "DOMAIN_PREFIX",
     "DOMAIN_SEPARATOR",

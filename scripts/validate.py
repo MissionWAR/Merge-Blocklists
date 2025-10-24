@@ -68,16 +68,20 @@ ELEMENT_HIDING_MARKERS = utils.ELEMENT_HIDING_MARKERS
 MAX_HOSTNAME_LENGTH = 255  # Maximum total hostname length
 MAX_LABEL_LENGTH = 63      # Maximum length per label (between dots)
 
-SUPPORTED_MODIFIERS = {
-    "important",
-    "ctag",
-    "dnstype",
-    "dnsrewrite",
-    "denyallow",
-    "badfilter",
-    "client",
-}
-LIMITING_MODIFIERS = {"denyallow", "badfilter", "client"}
+# Supported modifiers for DNS-level filtering (AdGuard Home)
+# Using frozenset for O(1) lookup performance and immutability
+SUPPORTED_MODIFIERS = frozenset({
+    "important",   # Priority control
+    "ctag",        # Client tag filtering
+    "dnstype",     # DNS record type
+    "dnsrewrite",  # Custom DNS responses
+    "denyallow",   # Exception domains
+    "badfilter",   # Disable another filter
+    "client",      # Client-specific rules
+})
+
+# Modifiers that require allow_ip=True
+LIMITING_MODIFIERS = frozenset({"denyallow", "badfilter", "client"})
 
 # -------------------------
 # Local-only regexes (not in utils)

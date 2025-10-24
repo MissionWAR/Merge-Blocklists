@@ -27,29 +27,7 @@ DOMAIN_SEPARATOR = utils.DOMAIN_SEPARATOR
 IO_BUFFER_SIZE = utils.IO_BUFFER_SIZE
 substring_between = utils.substring_between
 normalize_domain_token = utils.normalize_domain_token
-
-
-def _walk_suffixes(domain: str) -> Iterator[str]:
-    """
-    Yield domain and its parent suffixes in order.
-    
-    Example: a.b.c -> a.b.c, b.c, c
-    
-    Args:
-        domain: Domain string to walk
-        
-    Yields:
-        Domain and each parent suffix
-    """
-    if not domain:
-        return
-    cur = domain
-    yield cur
-    idx = cur.find(".")
-    while idx != -1:
-        cur = cur[idx + 1 :]
-        yield cur
-        idx = cur.find(".")
+walk_suffixes = utils.walk_suffixes
 
 
 def has_parent(domain: str, domain_set: set[str]) -> bool:
@@ -204,7 +182,6 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
 
     # Local refs for speed on big lists
     normalize = normalize_domain_token
-    walk_suffixes = _walk_suffixes
     domain_regex = utils.DOMAIN_REGEX
     is_hosts_re = utils.is_etc_hosts_rule
     load_hosts = utils.load_etc_hosts_rule_properties
@@ -432,7 +409,7 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
 
             # ----------------------------------------
             # 4. Everything else (regex, fragments, etc.)
-            #    We keep these as-is; aggressive filtering is responsibility of validate_adguard.py
+            #    We keep these as-is; aggressive filtering is responsibility of validate.py
             # ----------------------------------------
             if line in seen_rules_text:
                 stats["duplicates_removed"] += 1

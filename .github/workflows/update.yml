@@ -50,9 +50,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .cache
-          key: blocklists-cache-${{ hashFiles('sources.txt') }}-${{ github.run_id }}
+          key: blocklists-cache-${{ hashFiles('sources.txt') }}
           restore-keys: |
-            blocklists-cache-${{ hashFiles('sources.txt') }}-
             blocklists-cache-
 
       # ============================================

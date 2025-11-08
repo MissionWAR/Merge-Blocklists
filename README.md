@@ -2,7 +2,7 @@
 
 **Automatically fetch, clean, and combine DNS blocklists**
 
-Merge Blocklists collects and merges 80+ public DNS filterlists into a single, optimized blocklist for AdGuard Home.  
+Merge Blocklists collects and merges public DNS filterlists into a single, optimized blocklist for AdGuard Home.  
 It runs automatically twice a day on GitHub Actions, always up to date, deduplicated, and ready to use.
 
 ---

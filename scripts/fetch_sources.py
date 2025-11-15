@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 import random
 import shutil
 import time
@@ -82,6 +83,25 @@ def compute_file_sha(path: Path) -> str:
         while chunk := fh.read(CHUNK_SIZE):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _sync_cache_to_dest(cache_path: Path, dest_path: Path) -> None:
+    """Reuse cached file contents in out_dir via hardlink when possible, else copy."""
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    if dest_path.exists():
+        try:
+            if dest_path.samefile(cache_path):
+                return  # already pointing to the same inode
+        except (OSError, AttributeError):
+            pass
+        try:
+            dest_path.unlink()
+        except OSError:
+            pass
+    try:
+        os.link(cache_path, dest_path)
+    except OSError:
+        shutil.copy2(cache_path, dest_path)
 
 
 # ----------------------------------------
@@ -166,8 +186,9 @@ async def fetch_one(
                             last_modified=resp_last_modified,
                             content_sha256=content_sha,
                             status_code=resp.status,
+                            autosave=False,
                         )
-                        shutil.copy2(cached_file, dest_path)
+                        _sync_cache_to_dest(cached_file, dest_path)
                         return "not-modified", url, str(dest_path)
                     last_exc = Exception("304 received but no cached copy available")
                     raise last_exc
@@ -205,9 +226,10 @@ async def fetch_one(
                     last_modified=resp_last_modified,
                     content_sha256=content_sha,
                     status_code=resp.status,
+                    autosave=False,
                 )
 
-                shutil.copy2(cache_path, dest_path)
+                _sync_cache_to_dest(cache_path, dest_path)
                 return "ok", url, str(dest_path)
 
         except asyncio.TimeoutError:
@@ -243,7 +265,7 @@ async def fetch_one(
     cached = cache.get_cached_file(url)
     if cached and cached.exists():
         try:
-            shutil.copy2(cached, dest_path)
+            _sync_cache_to_dest(cached, dest_path)
             return "used-cache-on-fail", url, str(dest_path)
         except Exception as ex:
             return "failed", url, f"fallback copy error: {ex}"
@@ -285,24 +307,34 @@ async def fetch_all(
     )
     sem = asyncio.Semaphore(concurrency)
 
-    async with aiohttp.ClientSession(connector=connector) as session:
-        tasks = [
-            asyncio.create_task(
-                _fetch_with_limit(
-                    session, sem, url, cache, out_dir, timeout, retries, per_host_delay
+    try:
+        async with aiohttp.ClientSession(connector=connector) as session:
+            tasks = [
+                asyncio.create_task(
+                    _fetch_with_limit(
+                        session,
+                        sem,
+                        url,
+                        cache,
+                        out_dir,
+                        timeout,
+                        retries,
+                        per_host_delay,
+                    )
                 )
-            )
-            for url in urls
-        ]
+                for url in urls
+            ]
 
-        for coro in asyncio.as_completed(tasks):
-            status, url, info = await coro
-            results["processed"] += 1
-            results[status] = results.get(status, 0) + 1
-            
-            # Track failures for summary report (don't log immediately to avoid duplicates)
-            if status == "failed":
-                failed_urls.append((url, info))
+            for coro in asyncio.as_completed(tasks):
+                status, url, info = await coro
+                results["processed"] += 1
+                results[status] = results.get(status, 0) + 1
+
+                # Track failures for summary report (don't log immediately to avoid duplicates)
+                if status == "failed":
+                    failed_urls.append((url, info))
+    finally:
+        cache.save()
 
     # Write summary JSON into cache dir
     summary = {"summary": results, "timestamp": int(time.time())}

@@ -130,8 +130,14 @@ class CacheManager:
         last_modified: str | None,
         content_sha256: str | None,
         status_code: int,
+        *,
+        autosave: bool = True,
     ) -> None:
-        """Record a completed fetch operation to metadata."""
+        """
+        Record a completed fetch operation to metadata.
+
+        Set autosave=False to batch multiple updates before calling save() once.
+        """
         now = int(time.time())
         meta = {
             "url": url,
@@ -140,9 +146,11 @@ class CacheManager:
             "last_modified": last_modified,
             "content_sha256": content_sha256,
             "status_code": status_code,
+            "fetched_at": now,
         }
         self._meta[url] = meta
-        self.save()
+        if autosave:
+            self.save()
 
     def get_cached_file(self, url: str) -> Path | None:
         """

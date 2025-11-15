@@ -28,15 +28,12 @@ _ELEMENT_HIDING_PATTERN = utils.ELEMENT_HIDING_PATTERN_RE  # Shared precompiled 
 
 def _strip_trailing_hash_safe(s: str) -> str:
     """
-    Strip trailing inline comments introduced by '#', except when:
-{{ ... }}
-      - The '#' occurs inside a regex literal delimited by unescaped '/' characters (we skip /.../ segments).
+    Strip trailing inline comments introduced by '#', while preserving text when:
+      - The '#' appears inside a /regex literal/ (detected by matched unescaped '/').
       - The '#' is escaped ('\\#').
 
-    This implementation scans the line from left-to-right, skipping balanced unescaped
-    "/.../" regex segments. The first unescaped '#' found outside any regex is treated
-    as the start of an inline comment and everything after it is removed.
-
+    Walk left-to-right, skipping balanced regex segments; the first unescaped '#'
+    encountered outside a regex is treated as the start of a comment and trimmed.
     Always rstrip whitespace from the returned string.
     """
     if not s:

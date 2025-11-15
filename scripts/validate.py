@@ -353,11 +353,13 @@ def valid_adblock_rule(rule_text: str, allowed_ip: bool, stats: dict[str, int]) 
         stats["removed_malformed"] += 1
         return False
 
-    # wildcard-TLD: keep all (for spam TLD lists like Hagezi)
-    # Example: ||*.actor^, ||*.auction^ are kept without requiring modifiers
-    if wildcard_idx != -1:
-        stats["kept_wildcard_tld"] += 1
-        return True
+    # wildcard handling: only accept leading "*." forms (||*.example^)
+    if "*" in domain_to_check:
+        if domain_to_check.startswith("*.") and domain_to_check.count("*") == 1:
+            stats["kept_wildcard_tld"] += 1
+            return True
+        stats["removed_malformed"] += 1
+        return False
 
     # Validate domain token (IDN-aware)
     if not valid_hostname(domain_to_check, rule_text, allowed_ip, has_limit_modifier):

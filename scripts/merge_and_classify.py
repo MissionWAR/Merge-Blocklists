@@ -28,34 +28,9 @@ IO_BUFFER_SIZE = utils.IO_BUFFER_SIZE
 substring_between = utils.substring_between
 normalize_domain_token = utils.normalize_domain_token
 walk_suffixes = utils.walk_suffixes
-
-
-def has_parent(domain: str, domain_set: set[str]) -> bool:
-    """Return True if any strict parent of domain exists in domain_set (fast, no allocations)."""
-    if not domain:
-        return False
-    idx = domain.find(".")
-    while idx != -1:
-        domain = domain[idx + 1 :]
-        if domain in domain_set:
-            return True
-        idx = domain.find(".")
-    return False
-
-
-def minimal_covering_set(domains: set[str]) -> set[str]:
-    """
-    Return minimal covering set:
-    e.g., {'a.b.c', 'b.c'} -> {'b.c'} (since parent covers child).
-    Algorithm: sort by label count (ascending) and greedily add.
-    """
-    # sort: fewer dots first (shorter suffixes), tie-breaker by length
-    ordered = sorted(domains, key=lambda d: (d.count("."), len(d)))
-    minimal: set[str] = set()
-    for d in ordered:
-        if not has_parent(d, minimal):
-            minimal.add(d)
-    return minimal
+has_parent = utils.has_parent_domain
+minimal_covering_set = utils.minimal_covering_set
+is_domain_covered_by_wildcard = utils.is_domain_covered_by_wildcard
 
 
 # ----------------------------------------
@@ -82,67 +57,60 @@ def _canonicalize_ip(ip_raw: str) -> tuple[str | None, bool, bool]:
 # ABP first-pass collection (optimized single-pass with caching)
 # ----------------------------------------
 def collect_abp_and_cache_lines(input_dir: str) -> tuple[dict[str, set[str]], dict[str, list[str]]]:
+    """Process input files to collect ABP domains and cache file contents.
+    
+    Returns:
+        tuple: (abp_sets, file_lines_cache)
+            - abp_sets: {'raw_abp': set, 'abp_minimal': set, 'wildcard_roots': set}
+            - file_lines_cache: {filename: [line1, line2, ...]}
     """
-    Single-pass file reading: collect ABP domains AND cache all lines for later processing.
+    raw_abp = set()
+    wildcard_roots = set()
+    file_lines_cache = {}
     
-    IMPORTANT: Wildcard patterns (||*.domain^) are excluded from the minimal covering set
-    because they have different semantics than exact domain matches:
-      - ||*.lol^ blocks third-level+ domains (sub.example.lol)
-      - ||00oo.lol^ blocks second-level domain (00oo.lol)
-    
-    These are NOT redundant - they target different DNS hierarchy levels.
-    
-    Returns: (abp_sets, file_lines_cache)
-      - abp_sets: {'raw_abp': set, 'abp_minimal': set}
-      - file_lines_cache: {filename: [line1, line2, ...]}
-    """
-    raw_abp: set[str] = set()
-    file_lines_cache: dict[str, list[str]] = {}
-    input_path = Path(input_dir)
-    
-    for entry in sorted(input_path.iterdir(), key=lambda p: p.name.lower()):
-        if not entry.name.lower().endswith(".txt"):
+    # Process each .txt file in the input directory
+    for file_path in Path(input_dir).glob('*.txt'):
+        if not file_path.is_file():
             continue
-        if not entry.is_file():
-            continue
-        
-        lines: list[str] = []
-        with entry.open(encoding="utf-8-sig", errors="replace", buffering=IO_BUFFER_SIZE) as fh:
-            for raw in fh:
-                line = raw.rstrip("\r\n").strip()
+            
+        lines = []
+        with file_path.open(encoding='utf-8-sig', errors='replace') as f:
+            for line in f:
+                line = line.strip()
                 lines.append(line)
                 
                 if not line:
                     continue
-                    
-                # Collect ABP domains for minimal covering set
-                dom = substring_between(line, DOMAIN_PREFIX, DOMAIN_SEPARATOR)
-                if dom:
-                    # Handle wildcard patterns:
-                    # - ||*.lol^ (TLD wildcard) → treat as blocking all .lol domains
-                    # - ||*.example.com^ (subdomain wildcard) → only blocks subdomains, not example.com itself
-                    if dom.startswith("*."):
-                        # Strip the wildcard prefix
-                        base = dom[2:]
-                        # If no dots remain, it's a TLD wildcard (e.g., *.lol → lol)
-                        # These should participate in deduplication (||*.lol^ removes ||example.lol^)
-                        if "." not in base:
-                            dn_norm = normalize_domain_token(base)
-                            if dn_norm:
-                                raw_abp.add(dn_norm)
-                        # If dots remain, it's a subdomain wildcard (e.g., *.example.com → example.com)
-                        # Skip these - they don't block the parent domain itself
-                        continue
-                    
-                    # Normal domain rules
-                    dn_norm = normalize_domain_token(dom)
-                    if dn_norm:
-                        raw_abp.add(dn_norm)
+                
+                # Extract domain from ABP-style rules (||example.com^)
+                domain = substring_between(line, DOMAIN_PREFIX, DOMAIN_SEPARATOR)
+                if not domain:
+                    continue
+                if line.startswith("@@"):
+                    continue
+                
+                # Handle wildcard patterns
+                if domain.startswith('*.'):
+                    base = domain[2:]
+                    norm_base = normalize_domain_token(base)
+                    if norm_base:
+                        wildcard_roots.add(norm_base)
+                    continue
+                
+                # Process regular domains
+                norm_domain = normalize_domain_token(domain)
+                if norm_domain:
+                    raw_abp.add(norm_domain)
         
-        # Cache lines for later processing
-        file_lines_cache[entry.name] = lines
+        # Cache the file contents for later processing
+        file_lines_cache[file_path.name] = lines
     
-    return ({"raw_abp": raw_abp, "abp_minimal": minimal_covering_set(raw_abp)}, file_lines_cache)
+    # Return both the raw domains and the minimal covering set
+    return {
+        'raw_abp': raw_abp,
+        'abp_minimal': minimal_covering_set(raw_abp),
+        'wildcard_roots': wildcard_roots,
+    }, file_lines_cache
 
 
 # ----------------------------------------
@@ -157,12 +125,21 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
     # Single-pass: collect ABP sets and cache all file lines
     abp_sets, file_lines_cache = collect_abp_and_cache_lines(input_dir)
     abp_minimal = abp_sets["abp_minimal"]
+    abp_wildcards = abp_sets["wildcard_roots"]
+
+    def _covered_by_abp(domain: str) -> bool:
+        if not domain:
+            return False
+        if any(parent in abp_minimal for parent in walk_suffixes(domain)):
+            return True
+        return is_domain_covered_by_wildcard(domain, abp_wildcards)
 
     # domain_map: domain_norm -> (type, text, ip)
     domain_map: dict[str, tuple[str, str, str | None]] = {}
     host_line_to_hostnames: dict[str, list[str]] = {}
     host_line_to_hostnames_norm: dict[str, set[str]] = {}
     host_line_to_ip: dict[str, str] = {}
+    whitelist_domains: set[str] = set()
 
     # Use an insertion-ordered dict for final rules so we can write without an expensive sort.
     final_rules: dict[str, None] = {}
@@ -178,6 +155,8 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
         "invalid_removed": 0,
         "conflicting_hosts_skipped": 0,
         "conflicting_hosts_replaced": 0,
+        "abp_whitelists_removed": 0,
+        "abp_blocks_removed_by_whitelist": 0,
     }
 
     # Local refs for speed on big lists
@@ -215,12 +194,8 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
                 hn_norm = [normalize(h) for h in hostnames]
                 hn_norm_set = {h for h in hn_norm if h}
 
-                # Drop if covered by ABP minimal (parent or exact)
-                if any(
-                    any(parent in abp_minimal for parent in walk_suffixes(h))
-                    for h in hn_norm
-                    if h
-                ):
+                # Drop if covered by ABP rules (direct or wildcard-based)
+                if any(_covered_by_abp(h) for h in hn_norm if h):
                     stats["plain_or_hosts_removed_by_abp"] += 1
                     continue
 
@@ -323,6 +298,7 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
             # ----------------------------------------
             abp_domain = substring_between(line, DOMAIN_PREFIX, DOMAIN_SEPARATOR)
             if abp_domain:
+                is_whitelist_rule = line.startswith("@@")
                 # For wildcard subdomain patterns (||*.example.com^), preserve the wildcard in the map key
                 # to avoid collision with parent domain rules (||example.com^)
                 is_wildcard_subdomain = abp_domain.startswith("*.") and "." in abp_domain[2:]
@@ -335,7 +311,7 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
                 # If a parent ABP already covers this domain, remove this subdomain
                 # ONLY if this line is a bare ABP rule (no options) and not a whitelist.
                 if has_parent(dn_norm, abp_minimal):
-                    if not line.startswith("@@") and re_abp_bare.match(line):
+                    if not is_whitelist_rule and re_abp_bare.match(line):
                         stats["abp_subdomains_removed"] += 1
                         continue
                     # otherwise keep the more-specific rule (it might carry modifiers)
@@ -343,6 +319,18 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
                 # Determine the key for domain_map
                 # Wildcard subdomain patterns use "*.{normalized}" to avoid collision with parent
                 map_key = f"*.{dn_norm}" if is_wildcard_subdomain else dn_norm
+
+                if is_whitelist_rule:
+                    whitelist_domains.add(map_key)
+                    stats["abp_whitelists_removed"] += 1
+                    prev = domain_map.get(map_key)
+                    if prev and prev[0] == "abp":
+                        prev_text = prev[1]
+                        final_rules.pop(prev_text, None)
+                        seen_rules_text.discard(prev_text)
+                        domain_map.pop(map_key, None)
+                        stats["abp_blocks_removed_by_whitelist"] += 1
+                    continue
 
                 # Check if this normalized domain already exists as an ABP rule
                 # This catches case variations (||Example.COM^ vs ||example.com^)
@@ -367,6 +355,10 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
                     stats["duplicates_removed"] += 1
                     continue
 
+                if map_key in whitelist_domains:
+                    stats["abp_blocks_removed_by_whitelist"] += 1
+                    continue
+
                 seen_rules_text.add(line)
                 final_rules[line] = None
                 domain_map[map_key] = ("abp", line, None)
@@ -382,9 +374,8 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
                     stats["invalid_removed"] += 1
                     continue
 
-                # If ABP covers this domain (exact or parent), drop the plain domain.
-                # walk_suffixes yields domain and all parents, so single check is sufficient.
-                if any(parent in abp_minimal for parent in walk_suffixes(dn)):
+                # If ABP covers this domain (exact or wildcard coverage), drop it.
+                if _covered_by_abp(dn):
                     stats["plain_or_hosts_removed_by_abp"] += 1
                     continue
 
@@ -466,7 +457,9 @@ def _print_summary(stats: dict[str, int]) -> None:
         f"abp_subdomains_removed={stats.get('abp_subdomains_removed', 0)} "
         f"invalid_removed={stats.get('invalid_removed', 0)} "
         f"conflicting_hosts_replaced={stats.get('conflicting_hosts_replaced', 0)} "
-        f"conflicting_hosts_skipped={stats.get('conflicting_hosts_skipped', 0)}"
+        f"conflicting_hosts_skipped={stats.get('conflicting_hosts_skipped', 0)} "
+        f"abp_whitelists_removed={stats.get('abp_whitelists_removed', 0)} "
+        f"abp_blocks_removed_by_whitelist={stats.get('abp_blocks_removed_by_whitelist', 0)}"
     )
 
 

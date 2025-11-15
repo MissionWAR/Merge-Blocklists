@@ -31,6 +31,7 @@ walk_suffixes = utils.walk_suffixes
 has_parent = utils.has_parent_domain
 minimal_covering_set = utils.minimal_covering_set
 is_domain_covered_by_wildcard = utils.is_domain_covered_by_wildcard
+build_plain_domain_minimal_set = utils.build_plain_domain_minimal_set
 
 
 # ----------------------------------------
@@ -152,6 +153,7 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
         "duplicates_removed": 0,
         "plain_or_hosts_removed_by_abp": 0,
         "abp_subdomains_removed": 0,
+        "plain_subdomains_removed": 0,
         "invalid_removed": 0,
         "conflicting_hosts_skipped": 0,
         "conflicting_hosts_replaced": 0,
@@ -166,6 +168,10 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
     load_hosts = utils.load_etc_hosts_rule_properties
     canonicalize_ip = _canonicalize_ip
     re_abp_bare = utils.ABP_HOSTNAME_RE
+
+    plain_minimal = build_plain_domain_minimal_set(
+        file_lines_cache, normalize, domain_regex, is_hosts_re, _covered_by_abp
+    )
 
     # ------------------------------
     # Process cached file lines (no re-reading files)
@@ -379,6 +385,10 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
                     stats["plain_or_hosts_removed_by_abp"] += 1
                     continue
 
+                if has_parent(dn, plain_minimal):
+                    stats["plain_subdomains_removed"] += 1
+                    continue
+
                 # If a hosts mapping already claims this domain, prefer hosts and skip the plain domain.
                 # Also catches if plain domain already seen (avoiding redundant check below)
                 dm = domain_map.get(dn)
@@ -455,6 +465,7 @@ def _print_summary(stats: dict[str, int]) -> None:
         f"lines_out={stats.get('lines_out', 0)} duplicates_removed={stats.get('duplicates_removed', 0)} "
         f"plain_or_hosts_removed_by_abp={stats.get('plain_or_hosts_removed_by_abp', 0)} "
         f"abp_subdomains_removed={stats.get('abp_subdomains_removed', 0)} "
+        f"plain_subdomains_removed={stats.get('plain_subdomains_removed', 0)} "
         f"invalid_removed={stats.get('invalid_removed', 0)} "
         f"conflicting_hosts_replaced={stats.get('conflicting_hosts_replaced', 0)} "
         f"conflicting_hosts_skipped={stats.get('conflicting_hosts_skipped', 0)} "

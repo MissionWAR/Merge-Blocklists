@@ -33,7 +33,7 @@ import ipaddress
 import re
 import sys
 from functools import lru_cache
-from typing import Iterator
+from typing import Callable, Iterator
 
 
 # -------------------------
@@ -331,6 +331,41 @@ def minimal_covering_set(domains: set[str]) -> set[str]:
         if not has_parent_domain(domain, minimal):
             minimal.add(domain)
     return minimal
+
+
+def build_plain_domain_minimal_set(
+    file_lines_cache: dict[str, list[str]],
+    normalize: Callable[[str], str],
+    domain_regex: re.Pattern[str],
+    is_hosts_rule: Callable[[str], bool],
+    covered_by_abp: Callable[[str], bool],
+) -> set[str]:
+    """
+    Given cached lines from all input files, return the minimal covering set of plain domains.
+
+    Args:
+        file_lines_cache: Mapping of filename -> list of lines (already stripped).
+        normalize: Function to normalize individual domain tokens.
+        domain_regex: Precompiled regex to validate plain domains.
+        is_hosts_rule: Predicate identifying /etc/hosts-style rules.
+        covered_by_abp: Predicate reporting whether a domain is covered by ABP rules.
+    """
+    plain_domains: set[str] = set()
+    for lines in file_lines_cache.values():
+        for line in lines:
+            if not line:
+                continue
+            if line.startswith("@@") or line.startswith(DOMAIN_PREFIX):
+                continue
+            if is_hosts_rule(line):
+                continue
+            if "." not in line or not domain_regex.match(line):
+                continue
+            dn = normalize(line)
+            if not dn or covered_by_abp(dn):
+                continue
+            plain_domains.add(dn)
+    return minimal_covering_set(plain_domains)
 
 
 def is_domain_covered_by_wildcard(domain: str, wildcard_roots: set[str]) -> bool:

@@ -302,6 +302,55 @@ def walk_suffixes(domain: str) -> Iterator[str]:
         idx = cur.find(".")
 
 
+def has_parent_domain(domain: str, domain_set: set[str]) -> bool:
+    """
+    Return True if any parent of `domain` exists in domain_set.
+
+    Example:
+        has_parent_domain("a.b.c", {"b.c"}) -> True
+    """
+    if not domain or not domain_set:
+        return False
+    parts = domain.split(".")
+    for i in range(1, len(parts)):
+        if ".".join(parts[i:]) in domain_set:
+            return True
+    return False
+
+
+def minimal_covering_set(domains: set[str]) -> set[str]:
+    """
+    Return the smallest subset that covers all domains (remove redundant subdomains).
+
+    Example:
+        {"a.b.c", "b.c"} -> {"b.c"}
+    """
+    ordered = sorted(domains, key=lambda d: (d.count("."), len(d)))
+    minimal: set[str] = set()
+    for domain in ordered:
+        if not has_parent_domain(domain, minimal):
+            minimal.add(domain)
+    return minimal
+
+
+def is_domain_covered_by_wildcard(domain: str, wildcard_roots: set[str]) -> bool:
+    """
+    Return True if `domain` is covered by a wildcard in `wildcard_roots`.
+
+    Example:
+        wildcard_roots = {"example.com"}
+        is_domain_covered_by_wildcard("foo.example.com", wildcard_roots) -> True
+        is_domain_covered_by_wildcard("example.com", wildcard_roots) -> False
+    """
+    if not domain or not wildcard_roots or "." not in domain:
+        return False
+    parts = domain.split(".")
+    for i in range(1, len(parts)):
+        if ".".join(parts[i:]) in wildcard_roots:
+            return True
+    return False
+
+
 # -------------------------
 # Unescaped-char helpers
 # -------------------------
@@ -532,6 +581,9 @@ __all__ = [
     "find_unescaped_char",
     "find_last_unescaped_dollar",
     "walk_suffixes",
+    "has_parent_domain",
+    "minimal_covering_set",
+    "is_domain_covered_by_wildcard",
     # Constants
     "DOMAIN_PREFIX",
     "DOMAIN_SEPARATOR",

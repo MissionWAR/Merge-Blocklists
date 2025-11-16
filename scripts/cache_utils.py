@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -93,8 +94,10 @@ class CacheManager:
             self._meta = json.loads(content)
         except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
             # Corrupted metadata - start fresh
-            import sys
-            print(f"Warning: Cache metadata corrupted ({type(e).__name__}), starting fresh", file=sys.stderr)
+            print(
+                f"Warning: Cache metadata corrupted ({type(e).__name__}), starting fresh",
+                file=sys.stderr,
+            )
             self._meta = {}
 
     def save(self) -> None:
@@ -106,9 +109,7 @@ class CacheManager:
                 + "\n",
             )
         except Exception as e:
-            # best-effort; cache persistence should not fail the pipeline
-            # but log for debugging
-            import sys
+            # best-effort; cache persistence should not fail the pipeline but log for debugging
             print(f"Warning: Failed to save cache metadata: {e}", file=sys.stderr)
 
     # --------------------

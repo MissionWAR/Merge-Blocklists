@@ -18,7 +18,6 @@ from pathlib import Path
 from scripts import utils
 
 # Import constants and utilities from utils to avoid duplication
-ELEMENT_HIDING_MARKERS = utils.ELEMENT_HIDING_MARKERS
 IO_BUFFER_SIZE = utils.IO_BUFFER_SIZE
 
 # Use utils implementations for consistency
@@ -26,45 +25,60 @@ _find_unescaped_char = utils.find_unescaped_char
 _ELEMENT_HIDING_PATTERN = utils.ELEMENT_HIDING_PATTERN_RE  # Shared precompiled regex
 
 
+def _contains_element_hiding_marker(s: str) -> bool:
+    """Return True if the line contains element-hiding or scriptlet markers."""
+    return bool(_ELEMENT_HIDING_PATTERN.search(s))
+
+
+def _skip_regex_literal(s: str, opening_slash_idx: int) -> int:
+    """
+    Return the index immediately after the closing '/' of a regex literal.
+    If the literal is unterminated, return -1 so the caller can abort trimming.
+    """
+    closing = _find_unescaped_char(s, "/", start=opening_slash_idx + 1)
+    if closing == -1:
+        return -1
+    return closing + 1
+
+
 def _strip_trailing_hash_safe(s: str) -> str:
     """
-    Strip trailing inline comments introduced by '#', while preserving text when:
-      - The '#' appears inside a /regex literal/ (detected by matched unescaped '/').
-      - The '#' is escaped ('\\#').
+    Strip trailing inline comments introduced by '#'.
 
-    Walk left-to-right, skipping balanced regex segments; the first unescaped '#'
-    encountered outside a regex is treated as the start of a comment and trimmed.
+    A hash is treated as a comment marker only when it is the first unescaped '#'
+    encountered outside a /regex literal/. The helper keeps '#':
+      - inside balanced /regex/ segments,
+      - that were escaped via '\\#',
+      - or when the line contains element-hiding/scriptlet markers (##, #@#, #%#).
     Always rstrip whitespace from the returned string.
     """
     if not s:
         return ""
 
     # preserve element-hiding/scriptlet-containing lines as-is: validator handles them
-    # Optimized: use precompiled regex instead of 3 substring searches
-    if _ELEMENT_HIDING_PATTERN.search(s):
+    if _contains_element_hiding_marker(s):
         return s.rstrip()
 
-    start = 0
-    n = len(s)
-    while start < n:
-        pos_hash = _find_unescaped_char(s, "#", start=start)
-        pos_slash = _find_unescaped_char(s, "/", start=start)
+    scan_idx = 0
+    length = len(s)
+    while scan_idx < length:
+        hash_idx = _find_unescaped_char(s, "#", start=scan_idx)
+        slash_idx = _find_unescaped_char(s, "/", start=scan_idx)
 
-        # no hash at all -> nothing to strip
-        if pos_hash == -1:
+        # no further '#' characters -> nothing left to strip
+        if hash_idx == -1:
             return s.rstrip()
 
-        # if there's no slash before the hash, the hash is outside any regex -> strip here
-        if pos_slash == -1 or pos_hash < pos_slash:
-            return s[:pos_hash].rstrip()
+        # first interesting char is '#': treat the rest as a comment
+        if slash_idx == -1 or hash_idx < slash_idx:
+            return s[:hash_idx].rstrip()
 
-        # there's a slash before the hash -> find closing slash to skip the regex
-        end_slash = _find_unescaped_char(s, "/", start=pos_slash + 1)
-        if end_slash == -1:
-            # unterminated regex: be conservative and don't chop anything
+        # we saw a '/' before the '#'; treat it as the start of a /regex literal/
+        regex_end = _skip_regex_literal(s, slash_idx)
+        if regex_end == -1:
+            # unterminated literal: conservatively keep the line intact
             return s.rstrip()
-        # advance past the regex and keep scanning
-        start = end_slash + 1
+        scan_idx = regex_end
 
     return s.rstrip()
 

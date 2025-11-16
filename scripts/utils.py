@@ -333,6 +333,32 @@ def minimal_covering_set(domains: set[str]) -> set[str]:
     return minimal
 
 
+def _extract_plain_domain_candidate(
+    line: str,
+    normalize: Callable[[str], str],
+    domain_regex: re.Pattern[str],
+    is_hosts_rule: Callable[[str], bool],
+    covered_by_abp: Callable[[str], bool],
+) -> str:
+    """
+    Return a normalized plain-domain candidate or an empty string if the line
+    should be ignored for plain-domain minimal-set building.
+    """
+    if (
+        not line
+        or line.startswith("@@")
+        or line.startswith(DOMAIN_PREFIX)
+        or is_hosts_rule(line)
+        or "." not in line
+        or not domain_regex.match(line)
+    ):
+        return ""
+    dn = normalize(line)
+    if not dn or covered_by_abp(dn):
+        return ""
+    return dn
+
+
 def build_plain_domain_minimal_set(
     file_lines_cache: dict[str, list[str]],
     normalize: Callable[[str], str],
@@ -353,18 +379,11 @@ def build_plain_domain_minimal_set(
     plain_domains: set[str] = set()
     for lines in file_lines_cache.values():
         for line in lines:
-            if not line:
-                continue
-            if line.startswith("@@") or line.startswith(DOMAIN_PREFIX):
-                continue
-            if is_hosts_rule(line):
-                continue
-            if "." not in line or not domain_regex.match(line):
-                continue
-            dn = normalize(line)
-            if not dn or covered_by_abp(dn):
-                continue
-            plain_domains.add(dn)
+            candidate = _extract_plain_domain_candidate(
+                line, normalize, domain_regex, is_hosts_rule, covered_by_abp
+            )
+            if candidate:
+                plain_domains.add(candidate)
     return minimal_covering_set(plain_domains)
 
 
@@ -466,6 +485,14 @@ def extract_hostname(pattern: str | None) -> str | None:
     return m.group(1) if m else None
 
 
+def _build_option_entry(option_token: str) -> dict[str, str | None]:
+    """Return a {'name', 'value'} mapping for a single option token."""
+    if "=" in option_token:
+        name, val = option_token.split("=", 1)
+        return {"name": name, "value": val}
+    return {"name": option_token, "value": None}
+
+
 def load_adblock_rule_properties(rule_text: str) -> dict:
     """Parse Adblock-style rule into structured components."""
     tokens = parse_rule_tokens(rule_text.strip())
@@ -483,11 +510,7 @@ def load_adblock_rule_properties(rule_text: str) -> dict:
         if parts:
             opts_list: list[dict[str, str | None]] = []
             for opt in parts:
-                if "=" in opt:
-                    name, val = opt.split("=", 1)
-                    opts_list.append({"name": name, "value": val})
-                else:
-                    opts_list.append({"name": opt, "value": None})
+                opts_list.append(_build_option_entry(opt))
             rule["options"] = opts_list
 
     return rule

@@ -22,6 +22,7 @@ import json
 import os
 import random
 import shutil
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -351,7 +352,6 @@ async def fetch_all(
         purge_processed_like_files(out_dir)
         dedupe_outdir_by_content(out_dir)
     except Exception as e:
-        import sys
         print(f"Warning: Post-cleanup failed: {e}", file=sys.stderr)
 
     return {

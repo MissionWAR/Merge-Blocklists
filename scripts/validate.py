@@ -87,6 +87,7 @@ LIMITING_MODIFIERS = frozenset({"denyallow", "badfilter", "client"})
 # Local-only regexes (not in utils)
 # -------------------------
 _DOMAIN_ALLOWED_CHARS_RE = re.compile(r"^[a-zA-Z0-9\-\.\*\|\^:\/]+$")
+_IP_ALLOWED_CHARS = frozenset("0123456789.:[]abcdefABCDEF%")
 
 
 # -------------------------
@@ -222,6 +223,86 @@ def _is_element_hiding(rule_text: str) -> bool:
     return any(marker in rule_text for marker in ELEMENT_HIDING_MARKERS)
 
 
+def _pattern_is_regex_literal(pattern: str) -> bool:
+    """
+    Return True if the pattern is a raw /regex/ literal (without replace= modifiers).
+    """
+    return (
+        pattern.startswith("/")
+        and _find_unescaped_char(pattern, "/", start=1) != -1
+        and "replace=" not in pattern
+    )
+
+
+def _has_only_allowed_characters(pattern: str) -> bool:
+    """Ensure the pattern sticks to characters supported for DNS filtering."""
+    return bool(_DOMAIN_ALLOWED_CHARS_RE.match(pattern.removeprefix("://")))
+
+
+def _has_invalid_wildcard_combo(pattern: str, separator_idx: int) -> bool:
+    """Return True if a '*' appears after '^' (invalid for DNS-style blocking rules)."""
+    wildcard_idx = pattern.find(WILDCARD)
+    return (
+        separator_idx != -1
+        and wildcard_idx != -1
+        and wildcard_idx > separator_idx
+    )
+
+
+def _is_domain_anchored_pattern(pattern: str, separator_idx: int) -> bool:
+    """Return True if the pattern represents a '||domain^' style rule."""
+    return pattern.startswith(DOMAIN_PREFIX) and separator_idx != -1
+
+
+def _pattern_has_valid_terminator(pattern: str, separator_idx: int) -> bool:
+    """Return True if no invalid characters follow the '^' terminator."""
+    return not (
+        pattern
+        and len(pattern) > separator_idx + 1
+        and pattern[separator_idx + 1] != "|"
+    )
+
+
+def _validate_supported_modifiers(
+    options: list[dict[str, str | None]] | None, stats: dict[str, int]
+) -> tuple[bool, bool]:
+    """
+    Validate modifiers. Returns (is_valid, has_limiting_modifier).
+    """
+    has_limit_modifier = False
+    if not options:
+        return True, has_limit_modifier
+
+    for opt in options:
+        name = opt["name"]
+        if name == "domain" or name not in SUPPORTED_MODIFIERS:
+            stats["removed_bad_modifier"] += 1
+            return False, False
+        if name in LIMITING_MODIFIERS:
+            has_limit_modifier = True
+    return True, has_limit_modifier
+
+
+def _handle_wildcard_domain(
+    domain_token: str, stats: dict[str, int]
+) -> tuple[bool, bool]:
+    """
+    Handle wildcard-containing domains.
+
+    Returns:
+        (handled, keep_rule)
+        handled=True when the domain contains '*'.
+        keep_rule indicates whether the wildcard was accepted.
+    """
+    if "*" not in domain_token:
+        return False, False
+    if domain_token.startswith("*.") and domain_token.count("*") == 1:
+        stats["kept_wildcard_tld"] += 1
+        return True, True
+    stats["removed_malformed"] += 1
+    return True, False
+
+
 # -------------------------
 # Validation checks
 # -------------------------
@@ -248,8 +329,7 @@ def valid_hostname(
     # Quick check: IPs only contain digits, dots, colons, brackets, and hex chars (for IPv6)
     # This avoids expensive ipaddress parsing for obvious non-IPs (e.g., "example.com")
     is_ip = False
-    ip_chars = set('0123456789.:[]abcdefABCDEF%')  # % for zone IDs in IPv6
-    if all(c in ip_chars for c in host_for_ip):
+    if all(c in _IP_ALLOWED_CHARS for c in host_for_ip):
         # Potential IP - now do full validation
         try:
             ipaddress.ip_address(host_for_ip_unbr)
@@ -292,7 +372,6 @@ def valid_adblock_rule(rule_text: str, allowed_ip: bool, stats: dict[str, int]) 
     Validate adblock-style rules for DNS-level filtering.
     Updates stats counters for removed/kept categories.
     """
-    # element hiding/scriptlet rules are not DNS rules: remove them here (validator handles this)
     if _is_element_hiding(rule_text):
         stats["removed_element_hiding"] += 1
         return False
@@ -303,46 +382,28 @@ def valid_adblock_rule(rule_text: str, allowed_ip: bool, stats: dict[str, int]) 
         stats["removed_malformed"] += 1
         return False
 
-    has_limit_modifier = False
-    if props.get("options"):
-        for opt in props["options"]:
-            name = opt["name"]
-            if name == "domain":
-                stats["removed_bad_modifier"] += 1
-                return False
-            if name not in SUPPORTED_MODIFIERS:
-                stats["removed_bad_modifier"] += 1
-                return False
-            if name in LIMITING_MODIFIERS:
-                has_limit_modifier = True
+    modifiers_ok, has_limit_modifier = _validate_supported_modifiers(
+        props.get("options"), stats
+    )
+    if not modifiers_ok:
+        return False
 
     pat = props.get("pattern") or ""
 
-    # Regex literal (pattern starts with '/' and has a closing unescaped '/')
-    # Hostlist compiler treats regex rules as valid without compiling them; keep the same behaviour.
-    if (
-        pat.startswith("/")
-        and _find_unescaped_char(pat, "/", start=1) != -1
-        and "replace=" not in pat
-    ):
+    if _pattern_is_regex_literal(pat):
         stats["kept_regex"] += 1
         return True
 
-    # Quick allowed-characters check
-    to_test = pat.removeprefix("://")
-
-    if not _DOMAIN_ALLOWED_CHARS_RE.match(to_test):
+    if not _has_only_allowed_characters(pat):
         stats["removed_malformed"] += 1
         return False
 
     sep_idx = pat.find(DOMAIN_SEPARATOR)
-    wildcard_idx = pat.find(WILDCARD)
-    if sep_idx != -1 and wildcard_idx != -1 and wildcard_idx > sep_idx:
+    if _has_invalid_wildcard_combo(pat, sep_idx):
         stats["removed_malformed"] += 1
         return False
 
-    # Not an anchored domain pattern -> acceptable
-    if not pat.startswith(DOMAIN_PREFIX) or sep_idx == -1:
+    if not _is_domain_anchored_pattern(pat, sep_idx):
         stats["kept_other_adblock"] += 1
         return True
 
@@ -353,21 +414,17 @@ def valid_adblock_rule(rule_text: str, allowed_ip: bool, stats: dict[str, int]) 
         stats["removed_malformed"] += 1
         return False
 
-    # wildcard handling: only accept leading "*." forms (||*.example^)
-    if "*" in domain_to_check:
-        if domain_to_check.startswith("*.") and domain_to_check.count("*") == 1:
-            stats["kept_wildcard_tld"] += 1
-            return True
-        stats["removed_malformed"] += 1
-        return False
+    wildcard_handled, wildcard_allowed = _handle_wildcard_domain(
+        domain_to_check, stats
+    )
+    if wildcard_handled:
+        return wildcard_allowed
 
-    # Validate domain token (IDN-aware)
     if not valid_hostname(domain_to_check, rule_text, allowed_ip, has_limit_modifier):
         stats["removed_invalid_host"] += 1
         return False
 
-    # nothing allowed after '^' except optional '|'
-    if pat and len(pat) > (sep_idx + 1) and pat[sep_idx + 1] != "|":
+    if not _pattern_has_valid_terminator(pat, sep_idx):
         stats["removed_malformed"] += 1
         return False
 
@@ -414,8 +471,7 @@ def valid(rule_text: str, allowed_ip: bool, stats: dict[str, int]) -> bool:
 
     trimmed = rule_text.strip()
 
-    # Pure regex lines are accepted early (no compilation check to avoid rejecting patterns that
-    # the original hostlist compiler would accept). See hostlist compiler: regex rules pass through. :contentReference[oaicite:5]{index=5}
+    # Pure regex lines are accepted early (no compilation check) to mirror Hostlist Compiler behaviour.
     if _is_pure_regex_line(trimmed):
         stats["kept_regex"] += 1
         return True

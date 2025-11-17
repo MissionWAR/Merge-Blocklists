@@ -31,7 +31,7 @@ from urllib.parse import urlparse, urljoin, urldefrag
 import aiohttp
 
 from scripts import utils
-from scripts.cache_utils import CacheManager, atomic_write_text
+from scripts.cache_utils import CacheManager, atomic_write_text, hash_file
 
 
 # ----------------------------------------
@@ -300,7 +300,7 @@ async def _try_diff_update(
     per_host_delay: float,
     host_last_times: dict[str, float],
 ) -> bool:
-    """Attempt to update cached_file using diffupdates. Returns True on success."""
+    """Attempt to update cached_file using diffupdates (intentional incremental support). Returns True on success."""
     diff_path = diff_path.strip()
     if not diff_path:
         return False
@@ -333,13 +333,32 @@ async def _try_diff_update(
     except DiffApplyError as exc:
         _log_diff_failure(url, str(exc))
         return False
+    except Exception as exc:
+        _log_diff_failure(url, f"patch apply error: {exc}")
+        return False
 
     tmp = cached_file.with_suffix(".part")
     content_bytes = patched_text.encode("utf-8")
     tmp.parent.mkdir(parents=True, exist_ok=True)
-    with tmp.open("wb") as fh:
-        fh.write(content_bytes)
-    tmp.replace(cached_file)
+    try:
+        with tmp.open("wb") as fh:
+            fh.write(content_bytes)
+        tmp.replace(cached_file)
+    except OSError as exc:
+        _log_diff_failure(url, f"failed to store patched file: {exc}")
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        return False
+
+    try:
+        _sync_cache_to_dest(cached_file, dest_path)
+    except Exception as exc:
+        _log_diff_failure(url, f"failed to sync patched list: {exc}")
+        return False
 
     directives = _parse_filter_headers(cached_file)
     header_meta = _header_meta_from_directives(directives)
@@ -350,18 +369,13 @@ async def _try_diff_update(
         "status_code": 226,
     }
     updates.update(header_meta)
-    cache.update_meta(url, updates, autosave=False)
-    _sync_cache_to_dest(cached_file, dest_path)
+    try:
+        cache.update_meta(url, updates, autosave=False)
+    except Exception as exc:
+        _log_diff_failure(url, f"failed to update cache metadata: {exc}")
+        return False
+
     return True
-
-def compute_file_sha(path: Path) -> str:
-    """Compute SHA-256 of a file (used for deduplication)."""
-    h = hashlib.sha256()
-    with path.open("rb") as fh:
-        while chunk := fh.read(CHUNK_SIZE):
-            h.update(chunk)
-    return h.hexdigest()
-
 
 def _sync_cache_to_dest(cache_path: Path, dest_path: Path) -> None:
     """Reuse cached file contents in out_dir via hardlink when possible, else copy."""
@@ -717,7 +731,7 @@ def dedupe_outdir_by_content(out_dir: Path) -> None:
     for group in size_map.values():
         for p in group:
             try:
-                sha = compute_file_sha(p)
+                sha = hash_file(p)
                 sha_map.setdefault(sha, []).append(p)
             except Exception:
                 continue

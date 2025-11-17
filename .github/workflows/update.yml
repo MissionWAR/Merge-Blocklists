@@ -58,15 +58,7 @@ jobs:
             .cache
             .pipeline_cache
           # Invalidate caches when sources or core scripts change
-          key: blocklists-cache-${{ hashFiles(
-            'sources.txt',
-            'scripts/remove_comments.py',
-            'scripts/validate.py',
-            'scripts/merge_and_classify.py',
-            'scripts/utils.py',
-            'scripts/fetch_sources.py',
-            'scripts/pipeline.py'
-          ) }}
+          key: blocklists-cache-${{ hashFiles('sources.txt', 'scripts/remove_comments.py', 'scripts/validate.py', 'scripts/merge_and_classify.py', 'scripts/utils.py', 'scripts/fetch_sources.py', 'scripts/pipeline.py') }}
           restore-keys: |
             blocklists-cache-
 

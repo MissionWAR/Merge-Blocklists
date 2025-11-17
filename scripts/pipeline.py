@@ -26,6 +26,7 @@ from typing import Any
 import scripts.merge_and_classify as merge_and_classify
 import scripts.remove_comments as remove_comments
 import scripts.validate as validate
+from scripts import utils
 from scripts.cache_utils import IntermediateResultCache
 
 
@@ -49,13 +50,8 @@ def run_stage(module, inp: Path, out: Path, label: str) -> dict[str, Any]:
 
 
 def _collect_source_files(inp: Path) -> list[Path]:
-    if not inp.is_dir():
-        raise FileNotFoundError(f"Input directory not found: {inp}")
-    return [
-        entry
-        for entry in sorted(inp.iterdir(), key=lambda p: p.name.lower())
-        if entry.is_file() and entry.name.lower().endswith(".txt")
-    ]
+    """Return alphabetized list of source .txt files for the pipeline."""
+    return utils.list_text_rule_files(inp)
 
 
 def _cache_dir_for_input(inp: Path) -> Path:
@@ -69,6 +65,7 @@ def _clean_and_validate_with_cache(
     validated_dir: Path,
     cache: IntermediateResultCache,
 ) -> tuple[list[dict[str, int | str]], list[dict[str, int | str]], int]:
+    """Clean + validate inputs while persisting intermediates (cache-aware by design)."""
     clean_stats: list[dict[str, int | str]] = []
     validate_stats: list[dict[str, int | str]] = []
     reused = 0
@@ -93,7 +90,13 @@ def _clean_and_validate_with_cache(
         validate_stats.append(
             validate.process_file(str(cleaned_dest), str(validated_dest))
         )
-        cache.store_result(rel_key, raw_hash, cleaned_dest, validated_dest)
+        try:
+            cache.store_result(rel_key, raw_hash, cleaned_dest, validated_dest)
+        except Exception as exc:  # best-effort cache persistence
+            print(
+                f"[Pipeline] Warning: failed to cache intermediates for {rel_key}: {exc}",
+                file=sys.stderr,
+            )
 
     return clean_stats, validate_stats, reused
 

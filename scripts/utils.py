@@ -33,6 +33,7 @@ import ipaddress
 import re
 import sys
 from functools import lru_cache
+from pathlib import Path
 from typing import Callable, Iterator
 
 
@@ -96,11 +97,6 @@ def is_comment_line(line: str | None) -> bool:
     return s[:1] in ("!", "#") or _COMMENT_SEPARATOR_RE.fullmatch(s) is not None
 
 
-def is_rule_whitelisted(rule_text: str | None) -> bool:
-    """Return True if rule is an exception rule starting with '@@'."""
-    return bool(rule_text and rule_text.strip().startswith("@@"))
-
-
 def contains_non_ascii_characters(s: str) -> bool:
     """Return True if string contains non-ASCII characters."""
     if not isinstance(s, str):
@@ -120,6 +116,23 @@ def substring_between(s: str | None, start_tag: str, end_tag: str) -> str | None
     if end != -1:
         return s[start:end]
     return None
+
+
+# -------------------------
+# Filesystem helpers
+# -------------------------
+
+
+def list_text_rule_files(directory: str | Path) -> list[Path]:
+    """Return alphabetical list of *.txt files inside `directory`."""
+    base = Path(directory)
+    if not base.is_dir():
+        raise FileNotFoundError(f"Input directory not found: {directory}")
+    return [
+        entry
+        for entry in sorted(base.iterdir(), key=lambda p: p.name.lower())
+        if entry.is_file() and entry.suffix.lower() == ".txt"
+    ]
 
 
 # -------------------------
@@ -205,42 +218,6 @@ def split_by_delimiter_with_escape_character(
     return parts
 
 
-# -------------------------
-# Wildcard helper
-# -------------------------
-
-
-class Wildcard:
-    """Matches plain substring, '*' wildcard, or /regex/ patterns."""
-
-    def __init__(self, s: str):
-        if not s:
-            raise TypeError("Wildcard cannot be empty")
-        self.plain = s
-        self.regex: re.Pattern | None = None
-
-        if s.startswith("/") and s.endswith("/") and len(s) > 2:
-            inner = s[1:-1]
-            self.regex = re.compile(inner, flags=re.I | re.M)
-        elif "*" in s:
-            parts = [re.escape(p) for p in re.split(r"\*+", s)]
-            pattern = r"^" + r".*".join(parts) + r"$"
-            self.regex = re.compile(pattern, flags=re.I | re.S)
-
-    def test(self, s: str) -> bool:
-        if not isinstance(s, str):
-            raise TypeError("Invalid argument passed to Wildcard.test")
-        if self.regex is not None:
-            return bool(self.regex.search(s))
-        return self.plain in s
-
-    def __str__(self) -> str:
-        return self.plain
-
-    __repr__ = __str__
-
-
-# -------------------------
 # /etc/hosts parsing
 # -------------------------
 
@@ -333,6 +310,32 @@ def minimal_covering_set(domains: set[str]) -> set[str]:
     return minimal
 
 
+def _extract_plain_domain_candidate(
+    line: str,
+    normalize: Callable[[str], str],
+    domain_regex: re.Pattern[str],
+    is_hosts_rule: Callable[[str], bool],
+    covered_by_abp: Callable[[str], bool],
+) -> str:
+    """
+    Return a normalized plain-domain candidate or an empty string if the line
+    should be ignored for plain-domain minimal-set building.
+    """
+    if (
+        not line
+        or line.startswith("@@")
+        or line.startswith(DOMAIN_PREFIX)
+        or is_hosts_rule(line)
+        or "." not in line
+        or not domain_regex.match(line)
+    ):
+        return ""
+    dn = normalize(line)
+    if not dn or covered_by_abp(dn):
+        return ""
+    return dn
+
+
 def build_plain_domain_minimal_set(
     file_lines_cache: dict[str, list[str]],
     normalize: Callable[[str], str],
@@ -353,18 +356,11 @@ def build_plain_domain_minimal_set(
     plain_domains: set[str] = set()
     for lines in file_lines_cache.values():
         for line in lines:
-            if not line:
-                continue
-            if line.startswith("@@") or line.startswith(DOMAIN_PREFIX):
-                continue
-            if is_hosts_rule(line):
-                continue
-            if "." not in line or not domain_regex.match(line):
-                continue
-            dn = normalize(line)
-            if not dn or covered_by_abp(dn):
-                continue
-            plain_domains.add(dn)
+            candidate = _extract_plain_domain_candidate(
+                line, normalize, domain_regex, is_hosts_rule, covered_by_abp
+            )
+            if candidate:
+                plain_domains.add(candidate)
     return minimal_covering_set(plain_domains)
 
 
@@ -466,6 +462,14 @@ def extract_hostname(pattern: str | None) -> str | None:
     return m.group(1) if m else None
 
 
+def _build_option_entry(option_token: str) -> dict[str, str | None]:
+    """Return a {'name', 'value'} mapping for a single option token."""
+    if "=" in option_token:
+        name, val = option_token.split("=", 1)
+        return {"name": name, "value": val}
+    return {"name": option_token, "value": None}
+
+
 def load_adblock_rule_properties(rule_text: str) -> dict:
     """Parse Adblock-style rule into structured components."""
     tokens = parse_rule_tokens(rule_text.strip())
@@ -483,61 +487,10 @@ def load_adblock_rule_properties(rule_text: str) -> dict:
         if parts:
             opts_list: list[dict[str, str | None]] = []
             for opt in parts:
-                if "=" in opt:
-                    name, val = opt.split("=", 1)
-                    opts_list.append({"name": name, "value": val})
-                else:
-                    opts_list.append({"name": opt, "value": None})
+                opts_list.append(_build_option_entry(opt))
             rule["options"] = opts_list
 
     return rule
-
-
-def find_modifier(
-    rule_options: list[dict[str, str | None]] | None, name: str
-) -> dict[str, str | None] | None:
-    """Find modifier dict by name from a list of rule options."""
-    if not rule_options:
-        return None
-    for opt in rule_options:
-        if opt.get("name") == name:
-            return opt
-    return None
-
-
-def remove_modifier(rule_options: list[dict[str, str | None]], name: str) -> bool:
-    """Remove modifiers with matching name in-place."""
-    found = False
-    i = len(rule_options) - 1
-    while i >= 0:
-        if rule_options[i].get("name") == name:
-            rule_options.pop(i)
-            found = True
-        i -= 1
-    return found
-
-
-def adblock_rule_to_string(rule_props: dict) -> str:
-    """Reconstruct adblock rule string from parsed properties."""
-    out: list[str] = []
-    append_out = out.append
-    if rule_props.get("whitelist"):
-        append_out("@@")
-    append_out(rule_props.get("pattern") or "")
-    opts = rule_props.get("options")
-    if opts:
-        append_out("$")
-        # Optimized: build options list once instead of incremental appends
-        opt_parts = []
-        for opt in opts:
-            name = opt.get("name") or ""
-            val = opt.get("value")
-            if val is not None:
-                opt_parts.append(f"{name}={val}")
-            else:
-                opt_parts.append(name)
-        append_out(",".join(opt_parts))
-    return "".join(out)
 
 
 # -------------------------
@@ -571,22 +524,6 @@ def is_just_domain(token: str) -> bool:
     t = token.strip().lower().strip(".")
     return bool(_DOMAIN_REGEX.fullmatch(t))
 
-
-def is_ip_pattern(pattern: str | None) -> str | None:
-    """Return canonical IP if pattern is like '||IP^' else None."""
-    if not pattern:
-        return None
-    m = _ABP_HOSTNAME_RE.match(pattern.strip())
-    if not m:
-        return None
-    inner = m.group(1).strip().strip("[]")
-    if "%" in inner:
-        inner = inner.split("%", 1)[0]
-    try:
-        return str(ipaddress.ip_address(inner))
-    except Exception:
-        return None
-
 # Exports
 # -------------------------
 
@@ -594,24 +531,19 @@ __all__ = [
     # Functions
     "is_blank_line",
     "is_comment_line",
-    "is_rule_whitelisted",
+    "list_text_rule_files",
     "contains_non_ascii_characters",
     "substring_between",
     "split_by_delimiter_with_escape_character",
-    "Wildcard",
     "is_etc_hosts_rule",
     "load_etc_hosts_rule_properties",
     "canonicalize_ip",
     "parse_rule_tokens",
     "extract_hostname",
     "load_adblock_rule_properties",
-    "find_modifier",
-    "remove_modifier",
-    "adblock_rule_to_string",
     "convert_non_ascii_to_punycode",
     "normalize_domain_token",
     "to_punycode",
-    "is_ip_pattern",
     "is_just_domain",
     "find_unescaped_char",
     "find_last_unescaped_dollar",

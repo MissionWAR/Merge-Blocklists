@@ -1,35 +1,49 @@
 # Merge Blocklists
 
-**Automatically fetch, clean, and combine DNS blocklists**
+> [!NOTE]  
+> This project was made for personal use, but others may use it too.
 
-Merge Blocklists collects and merges public DNS filterlists into a single, optimized blocklist for AdGuard Home.  
-It runs automatically twice a day on GitHub Actions, always up to date, deduplicated, and ready to use.
 
----
+## ✨ What it does
 
-## ✨ Features
-
-- **Parallel fetching** of dozens of public blocklists  
-- **Removes** comments, cosmetic rules, and unsupported syntax  
-- **Validates** for AdGuard Home compatibility  
-- **Merges & deduplicates** intelligently  
-- **Publishes** automatically every 12 hours  
+- Fetches many public DNS blocklists  
+- Removes comments & invalid rules  
+- Normalizes and deduplicates entries  
+- Keeps only rules compatible with AdGuard Home  
+- Updates automatically every 12 hours via GitHub Actions  
 
 ---
 
-## 📝 License
+## 🚀 Usage (AdGuard Home)
 
-This project is provided *as-is* for personal use.  
-Please respect the licenses of all included third-party filterlists.
+1. Open **AdGuard Home**
+2. Go to **Filters → DNS blocklists**
+3. Click **Add blocklist**
+4. Paste this URL:
 
----
-
-## ⭐ Acknowledgments
-
-- The **AdGuard Team**, for the Hostlist Compiler inspiration  
-- **Filterlist maintainers**, for their ongoing community work  
-- The **open-source community**, for making projects like this possible  
+   ```text
+   https://github.com/MissionWAR/Merge-Blocklists/releases/download/merged-latest/merged.txt
+   ```
 
 ---
 
-**Made with ❤️ for a cleaner, faster internet**
+## 📚 Sources
+
+All upstream filter URLs are stored in:
+
+```
+sources.txt
+```
+
+Each list is maintained by its original author.
+
+---
+
+## ⭐ Thanks
+
+- **AdGuard Team** — inspiration for the idea  
+- **Filterlist maintainers** — keeping lists alive  
+- **Open-source community** — tools & documentation that made this possible
+
+> [!CAUTION]  
+> Please respect the licenses of the original blocklists if you fork or reuse this project.

@@ -22,15 +22,16 @@ import json
 import os
 import random
 import shutil
+import sys
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin, urldefrag
 
 import aiohttp
 
 from scripts import utils
-from scripts.cache_utils import CacheManager, atomic_write_text
+from scripts.cache_utils import CacheManager, atomic_write_text, hash_file
 
 
 # ----------------------------------------
@@ -76,14 +77,305 @@ def _should_retry_status(status: int) -> bool:
     return status == 429 or 500 <= status < 600
 
 
-def compute_file_sha(path: Path) -> str:
-    """Compute SHA-256 of a file (used for deduplication)."""
-    h = hashlib.sha256()
-    with path.open("rb") as fh:
-        while chunk := fh.read(CHUNK_SIZE):
-            h.update(chunk)
-    return h.hexdigest()
+def _parse_filter_headers(path: Path, max_lines: int = 200) -> dict[str, str]:
+    """Parse header directives (`! Key: Value`) from the start of a filter list."""
+    directives: dict[str, str] = {}
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for _ in range(max_lines):
+                line = fh.readline()
+                if not line:
+                    break
+                if not line.startswith("!"):
+                    break
+                body = line[1:].strip()
+                if ":" not in body:
+                    continue
+                key, value = body.split(":", 1)
+                directives[key.strip().lower()] = value.strip()
+    except OSError:
+        return {}
+    return directives
 
+
+def _header_meta_from_directives(directives: dict[str, str]) -> dict[str, str | None]:
+    """Extract cache metadata fields from parsed directives."""
+    if not directives:
+        return {}
+    diff_path = directives.get("diff-path")
+    checksum = directives.get("checksum")
+    meta: dict[str, str | None] = {}
+    if diff_path is not None:
+        meta["diff_path"] = diff_path or None
+    if checksum is not None:
+        meta["list_checksum"] = checksum or None
+    return meta
+
+
+def _resolve_diff_url(list_url: str, diff_path: str) -> tuple[str, str | None]:
+    """Return absolute patch URL and optional resource fragment from Diff-Path."""
+    relative, fragment = urldefrag(diff_path.strip())
+    if not relative:
+        raise ValueError("Diff-Path is empty")
+    patch_url = urljoin(list_url, relative)
+    if not patch_url:
+        raise ValueError("Unable to resolve Diff-Path")
+    return patch_url, fragment or None
+
+
+class DiffApplyError(Exception):
+    """Raised when a diffupdate patch cannot be applied."""
+
+
+def _parse_diff_blocks(diff_text: str) -> list[dict[str, Any]]:
+    """Parse diffupdate file into discrete RCS blocks."""
+    lines = diff_text.splitlines(keepends=True)
+    blocks: list[dict[str, Any]] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if not stripped:
+            i += 1
+            continue
+        if not stripped.lower().startswith("diff "):
+            i += 1
+            continue
+        header_fields = stripped[4:].strip().split()
+        header: dict[str, str] = {}
+        for field in header_fields:
+            if ":" not in field:
+                continue
+            key, value = field.split(":", 1)
+            header[key.lower()] = value
+        block = {
+            "name": header.get("name"),
+            "checksum": header.get("checksum"),
+            "commands": [],
+        }
+        blocks.append(block)
+        i += 1
+        while i < len(lines):
+            cmd_line = lines[i]
+            cmd_stripped = cmd_line.strip()
+            if cmd_stripped.lower().startswith("diff "):
+                break
+            if not cmd_stripped:
+                i += 1
+                continue
+            if cmd_stripped.startswith(";") or cmd_stripped.startswith("#"):
+                i += 1
+                continue
+            op = cmd_stripped[0].lower()
+            if op not in ("a", "d"):
+                raise DiffApplyError(f"Unsupported diff directive: {cmd_stripped}")
+            remainder = cmd_stripped[1:].strip()
+            parts = remainder.split()
+            if len(parts) != 2:
+                raise DiffApplyError(f"Malformed diff command: {cmd_stripped}")
+            try:
+                line_no = int(parts[0])
+                count = int(parts[1])
+            except ValueError as exc:
+                raise DiffApplyError(f"Invalid diff command numbers: {cmd_stripped}") from exc
+            i += 1
+            payload: list[str] = []
+            if op == "a":
+                payload = lines[i : i + count]
+                if len(payload) < count:
+                    raise DiffApplyError("Diff file truncated while reading additions")
+                i += count
+            block["commands"].append((op, line_no, count, payload))
+        # Inner while exits when next diff block encountered
+    return blocks
+
+
+def _apply_rcs_commands(original: list[str], commands: list[tuple[str, int, int, list[str]]]) -> list[str]:
+    """Apply RCS a/d commands to a list of lines."""
+    lines = list(original)
+    for op, line_no, count, payload in commands:
+        if op == "d":
+            start = line_no - 1
+            if count < 0 or start < 0 or start + count > len(lines):
+                raise DiffApplyError("Delete command out of range")
+            del lines[start : start + count]
+        elif op == "a":
+            insert_at = line_no
+            if count < 0 or insert_at < 0 or insert_at > len(lines):
+                raise DiffApplyError("Add command out of range")
+            lines[insert_at:insert_at] = payload
+        else:
+            raise DiffApplyError(f"Unsupported op: {op}")
+    return lines
+
+
+def _apply_diff_patch(
+    cached_file: Path, diff_text: str, resource_name: str | None
+) -> str:
+    """Apply diffupdate patch text to cached_file and return patched content."""
+    try:
+        original = cached_file.read_text(encoding="utf-8", errors="replace").splitlines(
+            keepends=True
+        )
+    except OSError as exc:
+        raise DiffApplyError(f"Unable to read cached file: {exc}") from exc
+
+    blocks = _parse_diff_blocks(diff_text)
+    if not blocks:
+        raise DiffApplyError("Patch file contains no diff blocks")
+
+    block = None
+    if resource_name:
+        for candidate in blocks:
+            if candidate.get("name") == resource_name:
+                block = candidate
+                break
+        if block is None:
+            raise DiffApplyError(f"No diff block found for resource '{resource_name}'")
+    else:
+        block = blocks[0]
+
+    commands = block.get("commands", [])
+    patched = _apply_rcs_commands(original, commands)
+    patched_text = "".join(patched)
+
+    checksum = block.get("checksum")
+    if checksum:
+        sha1 = hashlib.sha1(patched_text.encode("utf-8")).hexdigest()
+        if sha1.lower() != checksum.lower():
+            raise DiffApplyError("Checksum mismatch after applying patch")
+
+    return patched_text
+
+
+def _log_diff_failure(url: str, reason: str) -> None:
+    """Log diffupdate failure reasons without aborting the pipeline."""
+    print(f"[diffupdates] {url}: {reason}", file=sys.stderr)
+
+
+async def _download_patch_text(
+    session: aiohttp.ClientSession,
+    patch_url: str,
+    timeout: int,
+    per_host_delay: float,
+    host_last_times: dict[str, float],
+) -> str | None:
+    """Download patch text, returning None if not available."""
+    origin = _get_origin(patch_url)
+    await _wait_for_host_slot(origin, host_last_times, per_host_delay)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; MergeBlocklists/1.0; +https://github.com/filterlists-aggregator)"
+    }
+    timeout_obj = aiohttp.ClientTimeout(
+        total=timeout,
+        connect=10,
+        sock_read=timeout,
+    )
+    async with session.get(
+        patch_url,
+        headers=headers,
+        timeout=timeout_obj,
+        allow_redirects=True,
+        max_redirects=10,
+    ) as resp:
+        host_last_times[origin] = time.time()
+        if resp.status in (204, 404):
+            return None
+        if resp.status != 200:
+            raise DiffApplyError(f"Patch request failed with HTTP {resp.status}")
+        text = await resp.text(encoding="utf-8", errors="replace")
+        if not text.strip():
+            return None
+        return text
+
+
+async def _try_diff_update(
+    session: aiohttp.ClientSession,
+    url: str,
+    cache: CacheManager,
+    cached_file: Path,
+    diff_path: str,
+    dest_path: Path,
+    timeout: int,
+    per_host_delay: float,
+    host_last_times: dict[str, float],
+) -> bool:
+    """Attempt to update cached_file using diffupdates (intentional incremental support). Returns True on success."""
+    diff_path = diff_path.strip()
+    if not diff_path:
+        return False
+    try:
+        patch_url, resource_name = _resolve_diff_url(url, diff_path)
+    except ValueError as exc:
+        _log_diff_failure(url, f"invalid Diff-Path: {exc}")
+        return False
+
+    try:
+        patch_text = await _download_patch_text(
+            session, patch_url, timeout, per_host_delay, host_last_times
+        )
+    except asyncio.TimeoutError:
+        _log_diff_failure(url, "patch download timed out")
+        return False
+    except aiohttp.ClientError as exc:
+        _log_diff_failure(url, f"patch download failed: {type(exc).__name__}")
+        return False
+    except DiffApplyError as exc:
+        _log_diff_failure(url, str(exc))
+        return False
+
+    if not patch_text:
+        _log_diff_failure(url, "patch not available")
+        return False
+
+    try:
+        patched_text = _apply_diff_patch(cached_file, patch_text, resource_name)
+    except DiffApplyError as exc:
+        _log_diff_failure(url, str(exc))
+        return False
+    except Exception as exc:
+        _log_diff_failure(url, f"patch apply error: {exc}")
+        return False
+
+    tmp = cached_file.with_suffix(".part")
+    content_bytes = patched_text.encode("utf-8")
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with tmp.open("wb") as fh:
+            fh.write(content_bytes)
+        tmp.replace(cached_file)
+    except OSError as exc:
+        _log_diff_failure(url, f"failed to store patched file: {exc}")
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        return False
+
+    try:
+        _sync_cache_to_dest(cached_file, dest_path)
+    except Exception as exc:
+        _log_diff_failure(url, f"failed to sync patched list: {exc}")
+        return False
+
+    directives = _parse_filter_headers(cached_file)
+    header_meta = _header_meta_from_directives(directives)
+    content_sha = hashlib.sha256(content_bytes).hexdigest()
+    updates: dict[str, Any] = {
+        "content_sha256": content_sha,
+        "fetched_at": int(time.time()),
+        "status_code": 226,
+    }
+    updates.update(header_meta)
+    try:
+        cache.update_meta(url, updates, autosave=False)
+    except Exception as exc:
+        _log_diff_failure(url, f"failed to update cache metadata: {exc}")
+        return False
+
+    return True
 
 def _sync_cache_to_dest(cache_path: Path, dest_path: Path) -> None:
     """Reuse cached file contents in out_dir via hardlink when possible, else copy."""
@@ -123,18 +415,37 @@ async def fetch_one(
       status ∈ {"ok", "not-modified", "used-cache-on-fail", "failed"}
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = cache.path_for_url(url)
+    cached_file = cache.get_cached_file(url)
+    cache_path = cached_file or cache.path_for_url(url)
     dest_path = out_dir / cache_path.name
 
     origin = _get_origin(url)
     meta = cache.get_meta(url) or {}
-    cached_file = cache.get_cached_file(url)
     etag, last_modified = meta.get("etag"), meta.get("last_modified")
+    header_directives = _parse_filter_headers(cached_file) if cached_file else {}
+    diff_path = None
+    if cached_file:
+        diff_path = header_directives.get("diff-path") or meta.get("diff_path")
 
     # Track per-origin delay in session object
     if not hasattr(session, "_host_last_times"):
         session._host_last_times = {}  # type: ignore
     host_last_times: dict[str, float] = session._host_last_times  # type: ignore
+
+    if cached_file and diff_path:
+        diff_updated = await _try_diff_update(
+            session,
+            url,
+            cache,
+            cached_file,
+            diff_path,
+            dest_path,
+            timeout,
+            per_host_delay,
+            host_last_times,
+        )
+        if diff_updated:
+            return "ok", url, str(dest_path)
 
     attempt = 0
     last_exc: Exception | None = None
@@ -179,6 +490,7 @@ async def fetch_one(
                         )
                         # Reuse existing SHA from metadata (file hasn't changed)
                         content_sha = meta.get("content_sha256")
+                        header_meta = _header_meta_from_directives(header_directives)
                         cache.record_fetch(
                             url,
                             cached_file,
@@ -187,6 +499,7 @@ async def fetch_one(
                             content_sha256=content_sha,
                             status_code=resp.status,
                             autosave=False,
+                            extra=header_meta or None,
                         )
                         _sync_cache_to_dest(cached_file, dest_path)
                         return "not-modified", url, str(dest_path)
@@ -218,6 +531,8 @@ async def fetch_one(
                 resp_etag = resp.headers.get("ETag")
                 resp_last_modified = resp.headers.get("Last-Modified")
                 content_sha = hasher.hexdigest()
+                directives = _parse_filter_headers(cache_path)
+                header_meta = _header_meta_from_directives(directives)
 
                 cache.record_fetch(
                     url,
@@ -227,6 +542,7 @@ async def fetch_one(
                     content_sha256=content_sha,
                     status_code=resp.status,
                     autosave=False,
+                    extra=header_meta or None,
                 )
 
                 _sync_cache_to_dest(cache_path, dest_path)
@@ -351,7 +667,6 @@ async def fetch_all(
         purge_processed_like_files(out_dir)
         dedupe_outdir_by_content(out_dir)
     except Exception as e:
-        import sys
         print(f"Warning: Post-cleanup failed: {e}", file=sys.stderr)
 
     return {
@@ -416,7 +731,7 @@ def dedupe_outdir_by_content(out_dir: Path) -> None:
     for group in size_map.values():
         for p in group:
             try:
-                sha = compute_file_sha(p)
+                sha = hash_file(p)
                 sha_map.setdefault(sha, []).append(p)
             except Exception:
                 continue

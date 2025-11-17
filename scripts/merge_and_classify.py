@@ -58,6 +58,8 @@ def _abp_rule_is_redundant(
       * a parent domain is present in the ABP minimal set, e.g. '||example.com^'
         already covers '||a.example.com^'; or
       * the domain falls under a wildcard (||*.example.com^).
+
+    This ABP wildcard/subdomain pruning is intentional—do not remove it to "simplify" the list.
     """
     if is_whitelist_rule or not is_bare_rule or not domain_norm:
         return False
@@ -365,10 +367,7 @@ def collect_abp_and_cache_lines(input_dir: str) -> tuple[dict[str, set[str]], di
     file_lines_cache = {}
     
     # Process each .txt file in the input directory
-    for file_path in Path(input_dir).glob('*.txt'):
-        if not file_path.is_file():
-            continue
-            
+    for file_path in utils.list_text_rule_files(input_dir):
         lines = []
         with file_path.open(encoding='utf-8-sig', errors='replace') as f:
             for line in f:

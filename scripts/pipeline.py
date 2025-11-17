@@ -2,11 +2,11 @@
 """
 pipeline.py
 
-Full DNS blocklist build pipeline for AdGuard Home.
+Full DNS blocklist build pipeline for AdGuard Home with cache-aware cleanup/validation.
 
 Pipeline stages:
-  1. remove_comments     — Strip comments and blank lines.
-  2. validate            — Validate AdGuard-compatible syntax and hosts.
+  1. remove_comments     — Strip comments and blank lines (reuses cached outputs when possible).
+  2. validate            — Validate AdGuard-compatible syntax and hosts (cache-aware).
   3. merge_and_classify  — Merge, deduplicate, and normalize into a single output.
 
 Each stage writes to a temporary directory and passes its result to the next.
@@ -18,7 +18,6 @@ Usage:
 
 from __future__ import annotations
 
-import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -27,6 +26,10 @@ from typing import Any
 import scripts.merge_and_classify as merge_and_classify
 import scripts.remove_comments as remove_comments
 import scripts.validate as validate
+from scripts.cache_utils import IntermediateResultCache
+
+
+INTERMEDIATE_CACHE_DIR_NAME = ".pipeline_cache"
 
 
 # ----------------------------------------
@@ -45,38 +48,94 @@ def run_stage(module, inp: Path, out: Path, label: str) -> dict[str, Any]:
     return stats
 
 
+def _collect_source_files(inp: Path) -> list[Path]:
+    if not inp.is_dir():
+        raise FileNotFoundError(f"Input directory not found: {inp}")
+    return [
+        entry
+        for entry in sorted(inp.iterdir(), key=lambda p: p.name.lower())
+        if entry.is_file() and entry.name.lower().endswith(".txt")
+    ]
+
+
+def _cache_dir_for_input(inp: Path) -> Path:
+    return inp / INTERMEDIATE_CACHE_DIR_NAME
+
+
+def _clean_and_validate_with_cache(
+    files: list[Path],
+    inp_root: Path,
+    cleaned_dir: Path,
+    validated_dir: Path,
+    cache: IntermediateResultCache,
+) -> tuple[list[dict[str, int | str]], list[dict[str, int | str]], int]:
+    clean_stats: list[dict[str, int | str]] = []
+    validate_stats: list[dict[str, int | str]] = []
+    reused = 0
+
+    cleaned_dir.mkdir(parents=True, exist_ok=True)
+    validated_dir.mkdir(parents=True, exist_ok=True)
+
+    for src in files:
+        rel_path = src.relative_to(inp_root)
+        rel_key = rel_path.as_posix()
+        raw_hash = cache.raw_hash(src)
+        cleaned_dest = cleaned_dir / rel_path
+        validated_dest = validated_dir / rel_path
+
+        if cache.can_reuse(rel_key, raw_hash) and cache.restore(
+            rel_key, cleaned_dest, validated_dest
+        ):
+            reused += 1
+            continue
+
+        clean_stats.append(remove_comments.process_file(src, cleaned_dest))
+        validate_stats.append(
+            validate.process_file(str(cleaned_dest), str(validated_dest))
+        )
+        cache.store_result(rel_key, raw_hash, cleaned_dest, validated_dest)
+
+    return clean_stats, validate_stats, reused
+
+
 # ----------------------------------------
 # Pipeline core
 # ----------------------------------------
 def transform(input_dir: str, output_file: str) -> None:
-    """Run the full blocklist processing pipeline.
-    
-    Processing steps:
-    1. Remove comments and empty lines
-    2. Validate rules
-    3. Merge and deduplicate
-    4. Save final output
-    """
+    """Run the full blocklist processing pipeline."""
+
     inp_path = Path(input_dir)
     out_path = Path(output_file)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    
+    source_files = _collect_source_files(inp_path)
+    cache_dir = _cache_dir_for_input(inp_path)
+    cache = IntermediateResultCache(cache_dir)
+
     with tempfile.TemporaryDirectory(prefix="pipeline_") as tmpdir:
         tmp = Path(tmpdir)
-        
-        # Stage 1: Clean up input files
         cleaned_dir = tmp / "cleaned"
-        run_stage(remove_comments, inp_path, cleaned_dir, "Cleaning input files")
-        
-        # Stage 2: Validate rules
         validated_dir = tmp / "validated"
-        run_stage(validate, cleaned_dir, validated_dir, "Validating rules")
-        
-        # Stage 3: Merge and deduplicate
+
+        print("[Pipeline] Starting stage: Cleaning input files")
+        clean_stats, validate_stats, reused = _clean_and_validate_with_cache(
+            source_files, inp_path, cleaned_dir, validated_dir, cache
+        )
+        if hasattr(remove_comments, "_print_summary"):
+            remove_comments._print_summary(clean_stats)
+
+        print("[Pipeline] Starting stage: Validating rules")
+        if hasattr(validate, "_print_summary"):
+            validate._print_summary(validate_stats)
+
+        total_files = len(source_files)
+        if total_files:
+            print(
+                f"[Pipeline] Cached intermediates reused: {reused}/{total_files} files"
+            )
+
         merged_file = tmp / "merged.txt"
         run_stage(merge_and_classify, validated_dir, merged_file, "Merging and deduplicating")
-        
-        # Save final output atomically
+
         merged_file.replace(out_path)
         print(f"[Pipeline] Successfully saved output to: {out_path}")
 

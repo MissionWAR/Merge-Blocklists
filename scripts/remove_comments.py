@@ -200,9 +200,7 @@ def transform(
         
         # Collect all files to process
         files_to_process = [
-            (entry, out / entry.name)
-            for entry in sorted(inp.iterdir(), key=lambda p: p.name.lower())
-            if entry.is_file() and entry.name.lower().endswith(".txt")
+            (entry, out / entry.name) for entry in utils.list_text_rule_files(inp)
         ]
         
         if not files_to_process:

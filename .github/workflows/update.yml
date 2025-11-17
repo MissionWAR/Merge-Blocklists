@@ -16,6 +16,11 @@ env:
 permissions:
   contents: write
 
+# Ensure only a single workflow run is active at a time
+concurrency:
+  group: merge-blocklists
+  cancel-in-progress: true
+
 jobs:
   update:
     runs-on: ubuntu-latest
@@ -46,11 +51,22 @@ jobs:
       # ============================================
       # Caching
       # ============================================
-      - name: Restore blocklist cache
+      - name: Restore blocklist caches
         uses: actions/cache@v4
         with:
-          path: .cache
-          key: blocklists-cache-${{ hashFiles('sources.txt') }}
+          path: |
+            .cache
+            .pipeline_cache
+          # Invalidate caches when sources or core scripts change
+          key: blocklists-cache-${{ hashFiles(
+            'sources.txt',
+            'scripts/remove_comments.py',
+            'scripts/validate.py',
+            'scripts/merge_and_classify.py',
+            'scripts/utils.py',
+            'scripts/fetch_sources.py',
+            'scripts/pipeline.py'
+          ) }}
           restore-keys: |
             blocklists-cache-
 
@@ -82,7 +98,7 @@ jobs:
           set -euo pipefail
           echo "⚙️ Processing through pipeline..."
           
-          # Run the full pipeline
+          # Run the full pipeline (uses .pipeline_cache internally when available)
           python -m scripts.pipeline "${{ env.RAW_OUT }}" "${{ env.MERGED_OUT }}"
           
           # Verify output exists
@@ -124,7 +140,7 @@ jobs:
         run: |
           set -euo pipefail
           
-          # Check minimum rule count (prevent empty releases)
+          # Check minimum rule count (prevent empty or broken releases)
           MIN_RULES=1000
           if [ "${{ steps.stats.outputs.total_rules }}" -lt "$MIN_RULES" ]; then
             echo "⚠️ WARNING: Only ${{ steps.stats.outputs.total_rules }} rules (expected >$MIN_RULES)"
@@ -176,8 +192,8 @@ jobs:
           echo "🧹 Cleaning up old cache entries (>7 days)..."
           find .cache -type f -mtime +7 -delete 2>/dev/null || true
           
-          # Clean up temporary files
-          rm -rf lists/_raw 2>/dev/null || true
+          # Clean up temporary raw files (keep caches)
+          rm -rf "${{ env.RAW_OUT }}" 2>/dev/null || true
           
           echo "✅ Cleanup completed"
 
@@ -189,7 +205,6 @@ jobs:
           
           ## Status
           - **Workflow**: ${{ job.status }}
-          - **Duration**: ${{ steps.stats.conclusion == 'success' && '✅ Success' || '❌ Failed' }}
           
           ## Statistics
           | Metric | Value |

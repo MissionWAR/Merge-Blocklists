@@ -1,7 +1,6 @@
 https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt
 https://adguardteam.github.io/HostlistsRegistry/assets/filter_6.txt
 https://adguardteam.github.io/HostlistsRegistry/assets/filter_7.txt
-https://adguardteam.github.io/HostlistsRegistry/assets/filter_9.txt
 https://adguardteam.github.io/HostlistsRegistry/assets/filter_11.txt
 https://adguardteam.github.io/HostlistsRegistry/assets/filter_26.txt
 https://adguardteam.github.io/HostlistsRegistry/assets/filter_39.txt
@@ -31,7 +30,6 @@ https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Malwar
 https://raw.githubusercontent.com/matomo-org/referrer-spam-list/master/spammers.txt
 https://raw.githubusercontent.com/MajkiIT/polish-ads-filter/master/polish-pihole-filters/hostfile.txt
 https://raw.githubusercontent.com/abpvn/abpvn/master/filter/src/abpvn_ad_domain.txt
-https://raw.githubusercontent.com/bigdargon/hostsVN/master/option/hosts-VN
 https://raw.githubusercontent.com/yous/YousList/master/hosts.txt
 https://raw.githubusercontent.com/hoshsadiq/adblock-nocoin-list/master/hosts.txt
 https://raw.githubusercontent.com/AssoEchap/stalkerware-indicators/refs/heads/master/generated/hosts_full
@@ -63,7 +61,6 @@ https://www.github.developerdan.com/hosts/lists/amp-hosts-extended.txt
 https://badblock.celenity.dev/abp/badblock_plus.txt
 https://big.oisd.nl
 https://someonewhocares.org/hosts/
-https://sysctl.org/cameleon/hosts
 https://divested.dev/hosts-domains-wildcards
 https://feodotracker.abuse.ch/downloads/ipblocklist.txt
 https://hostfiles.frogeye.fr/firstparty-trackers-hosts.txt

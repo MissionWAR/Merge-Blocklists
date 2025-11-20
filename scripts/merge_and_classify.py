@@ -34,7 +34,6 @@ minimal_covering_set = utils.minimal_covering_set
 is_domain_covered_by_wildcard = utils.is_domain_covered_by_wildcard
 build_plain_domain_minimal_set = utils.build_plain_domain_minimal_set
 
-
 def _is_bare_abp_rule(
     rule_text: str, is_wildcard_subdomain: bool, re_abp_bare: Pattern[str]
 ) -> bool:
@@ -57,7 +56,8 @@ def _abp_rule_is_redundant(
     A rule is redundant when:
       * a parent domain is present in the ABP minimal set, e.g. '||example.com^'
         already covers '||a.example.com^'; or
-      * the domain falls under a wildcard (||*.example.com^).
+      * the domain falls under a wildcard (||*.example.com^); or
+      * this is a wildcard (||*.example.com^) and the parent domain exists (||example.com^).
 
     This ABP wildcard/subdomain pruning is intentional—do not remove it to "simplify" the list.
     """
@@ -66,6 +66,11 @@ def _abp_rule_is_redundant(
     # Parent coverage: `has_parent` only succeeds for strict parents (not the domain itself)
     if has_parent(domain_norm, ctx.abp_minimal):
         return True
+    # Wildcard is redundant if its parent domain is already in abp_minimal
+    if domain_norm.startswith("*."):
+        parent_domain = domain_norm[2:]
+        if parent_domain in ctx.abp_minimal:
+            return True
     # Wildcard coverage: honours that '*.example.com' does not cover the apex domain
     return is_domain_covered_by_wildcard(domain_norm, ctx.abp_wildcards)
 
@@ -81,12 +86,6 @@ def handle_hosts_line(
         return True
 
     ip_part = props["ip"]
-    hostnames = props["hostnames"]
-    hn_norm = [ctx.normalize(h) for h in hostnames]
-    hn_norm_set = {h for h in hn_norm if h}
-
-    if any(ctx.covered_by_abp(h) for h in hn_norm_set):
-        stats["hosts_removed_by_abp"] += 1
         return True
 
     out_line = f"{ip_part} {' '.join(hostnames)}"
@@ -231,16 +230,22 @@ def handle_plain_domain_line(
         stats["invalid_removed"] += 1
         return True
 
+    if _domain_is_whitelisted(dn, state.whitelist_domains):
+        stats["plain_removed_by_whitelist"] += 1
+        return True
+
+    # Fast O(1) checks first
+    if dn in state.domain_map or state.has_seen(line):
+        stats["duplicates_removed"] += 1
+        return True
+
+    # Slower O(n) checks
     if ctx.covered_by_abp(dn):
         stats["plain_removed_by_abp"] += 1
         return True
 
     if has_parent(dn, ctx.plain_minimal):
         stats["plain_subdomains_removed"] += 1
-        return True
-
-    if dn in state.domain_map or state.has_seen(line):
-        stats["duplicates_removed"] += 1
         return True
 
     state.add_rule(line)
@@ -263,14 +268,26 @@ class MergeState:
     """
     Mutable state shared by the individual line handlers.
 
+    The domain_map stores tuples of (rule_type, rule_text, ip) where:
+      - rule_type: "abp", "hosts", or "plain"
+      - rule_text: the original rule line
+      - ip: IP address (for hosts rules) or None
+
     Attributes:
-        final_rules: Insertion-ordered mapping of every rule kept in the final list.
-        seen_rules_text: Fast duplicate detector for raw rule text.
-        domain_map: Maps normalized domains to a tuple(type, rule_text, ip).
-        host_line_to_hostnames: Original hostnames for each hosts line.
-        host_line_to_hostnames_norm: Normalized hostname set per hosts line.
-        host_line_to_ip: Original IP (string) for each hosts line.
-        whitelist_domains: Normalized domains removed due to whitelisting.
+        final_rules:
+            Insertion-ordered mapping of every rule kept in the final list.
+        seen_rules_text:
+            Fast duplicate detector for raw rule text.
+        domain_map:
+            Maps normalized domains to (rule_type, rule_text, ip) tuples.
+        host_line_to_hostnames:
+            Original hostnames for each hosts line.
+        host_line_to_hostnames_norm:
+            Normalized hostname set per hosts line.
+        host_line_to_ip:
+            Original IP (string) for each hosts line.
+        whitelist_domains:
+            Normalized domains removed due to whitelisting.
     """
 
     final_rules: dict[str, None] = field(default_factory=dict)
@@ -436,7 +453,9 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
         "lines_out": 0,
         "duplicates_removed": 0,
         "hosts_removed_by_abp": 0,
+        "hosts_removed_by_whitelist": 0,
         "plain_removed_by_abp": 0,
+        "plain_removed_by_whitelist": 0,
         "abp_subdomains_removed": 0,
         "plain_subdomains_removed": 0,
         "invalid_removed": 0,
@@ -444,6 +463,7 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
         "conflicting_hosts_replaced": 0,
         "abp_whitelists_removed": 0,
         "abp_blocks_removed_by_whitelist": 0,
+        "local_hosts_removed": 0,
     }
 
     # Local refs for speed on big lists
@@ -542,14 +562,17 @@ def _print_summary(stats: dict[str, int]) -> None:
         f"files={stats.get('files', 0)} lines_in={stats.get('lines_in', 0)} "
         f"lines_out={stats.get('lines_out', 0)} duplicates_removed={stats.get('duplicates_removed', 0)} "
         f"hosts_removed_by_abp={stats.get('hosts_removed_by_abp', 0)} "
+        f"hosts_removed_by_whitelist={stats.get('hosts_removed_by_whitelist', 0)} "
         f"plain_removed_by_abp={stats.get('plain_removed_by_abp', 0)} "
+        f"plain_removed_by_whitelist={stats.get('plain_removed_by_whitelist', 0)} "
         f"abp_subdomains_removed={stats.get('abp_subdomains_removed', 0)} "
         f"plain_subdomains_removed={stats.get('plain_subdomains_removed', 0)} "
         f"invalid_removed={stats.get('invalid_removed', 0)} "
         f"conflicting_hosts_replaced={stats.get('conflicting_hosts_replaced', 0)} "
         f"conflicting_hosts_skipped={stats.get('conflicting_hosts_skipped', 0)} "
         f"abp_whitelists_removed={stats.get('abp_whitelists_removed', 0)} "
-        f"abp_blocks_removed_by_whitelist={stats.get('abp_blocks_removed_by_whitelist', 0)}"
+        f"abp_blocks_removed_by_whitelist={stats.get('abp_blocks_removed_by_whitelist', 0)} "
+        f"local_hosts_removed={stats.get('local_hosts_removed', 0)}"
     )
 
 

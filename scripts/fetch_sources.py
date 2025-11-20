@@ -53,6 +53,13 @@ DEFAULT_PER_HOST_DELAY = 0.2  # seconds
 # ----------------------------------------
 # Helpers
 # ----------------------------------------
+def _backoff_delay(attempt: int) -> float:
+    """Return capped exponential backoff with small jitter (10s max)."""
+    base = 0.5 * (2 ** (attempt - 1))
+    jitter = random.uniform(0, base * 0.1)
+    return min(base + jitter, 10.0)
+
+
 def _get_origin(url: str) -> str:
     """Return canonical origin (scheme://host[:port]) for rate limiting."""
     p = urlparse(url)
@@ -487,7 +494,7 @@ async def fetch_one(
         header_directives.get("checksum") or meta.get("list_checksum")
     )
 
-    # Track per-origin delay in session object
+    # Track per-origin delay in session object so concurrent coroutines share pacing
     if not hasattr(session, "_host_last_times"):
         session._host_last_times = {}  # type: ignore
     host_last_times: dict[str, float] = session._host_last_times  # type: ignore
@@ -635,17 +642,13 @@ async def fetch_one(
         except asyncio.TimeoutError:
             last_exc = Exception("Timeout - server did not respond in time")
             if attempt <= retries:
-                base = 0.5 * (2 ** (attempt - 1))
-                jitter = random.uniform(0, base * 0.1)
-                await asyncio.sleep(min(base + jitter, 10.0))
+                await asyncio.sleep(_backoff_delay(attempt))
                 continue
             break
         except aiohttp.ClientConnectionError as ex:
             last_exc = Exception(f"Connection error - {type(ex).__name__}")
             if attempt <= retries:
-                base = 0.5 * (2 ** (attempt - 1))
-                jitter = random.uniform(0, base * 0.1)
-                await asyncio.sleep(min(base + jitter, 10.0))
+                await asyncio.sleep(_backoff_delay(attempt))
                 continue
             break
         except aiohttp.ClientSSLError as ex:
@@ -655,9 +658,7 @@ async def fetch_one(
         except Exception as ex:
             last_exc = ex
             if attempt <= retries:
-                base = 0.5 * (2 ** (attempt - 1))
-                jitter = random.uniform(0, base * 0.1)
-                await asyncio.sleep(min(base + jitter, 10.0))
+                await asyncio.sleep(_backoff_delay(attempt))
                 continue
             break
 

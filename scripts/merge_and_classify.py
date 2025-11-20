@@ -14,7 +14,6 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-
 from typing import Callable, Pattern
 
 from scripts import utils
@@ -34,6 +33,31 @@ minimal_covering_set = utils.minimal_covering_set
 is_domain_covered_by_wildcard = utils.is_domain_covered_by_wildcard
 build_plain_domain_minimal_set = utils.build_plain_domain_minimal_set
 
+# compatibility shim for legacy tests
+_walk_suffixes = utils.walk_suffixes
+
+
+LOCAL_ONLY_HOSTNAMES = {
+    "localhost",
+    "localhost.localdomain",
+    "localhost4",
+    "localhost4.localdomain4",
+    "localhost6",
+    "localhost6.localdomain6",
+    "localdomain",
+    "localdomain.localhost",
+    "local",
+    "ip6-localhost",
+    "ip6-loopback",
+    "ip6-localnet",
+    "ip6-mcastprefix",
+    "ip6-allnodes",
+    "ip6-allrouters",
+    "ip6-allhosts",
+    "broadcasthost",
+}
+
+
 def _is_bare_abp_rule(
     rule_text: str, is_wildcard_subdomain: bool, re_abp_bare: Pattern[str]
 ) -> bool:
@@ -48,6 +72,7 @@ def _abp_rule_is_redundant(
     *,
     is_bare_rule: bool,
     is_whitelist_rule: bool,
+    is_wildcard_rule: bool,
     ctx: MergeContext,
 ) -> bool:
     """
@@ -66,13 +91,93 @@ def _abp_rule_is_redundant(
     # Parent coverage: `has_parent` only succeeds for strict parents (not the domain itself)
     if has_parent(domain_norm, ctx.abp_minimal):
         return True
-    # Wildcard is redundant if its parent domain is already in abp_minimal
-    if domain_norm.startswith("*."):
-        parent_domain = domain_norm[2:]
-        if parent_domain in ctx.abp_minimal:
-            return True
+    # wildcard redundant if its parent apex rule already exists
+    if is_wildcard_rule and domain_norm in ctx.abp_minimal:
+        return True
     # Wildcard coverage: honours that '*.example.com' does not cover the apex domain
     return is_domain_covered_by_wildcard(domain_norm, ctx.abp_wildcards)
+
+
+def _domain_is_whitelisted(domain: str, whitelist: set[str]) -> bool:
+    """
+    Return True if `domain` or any parent/wildcard is whitelisted.
+
+    Wildcards in the whitelist (e.g., '*.example.com') intentionally cover
+    every subdomain but not the apex; walk_suffixes keeps that behaviour visible.
+    """
+    if not domain or not whitelist:
+        return False
+    if domain in whitelist:
+        return True
+    for suffix in walk_suffixes(domain):
+        if suffix == domain:
+            continue
+        if suffix in whitelist:
+            return True
+        wildcard_key = f"*.{suffix}"
+        if wildcard_key in whitelist:
+            return True
+    return False
+
+
+def _apply_whitelist_retroactively(
+    state: MergeState, ctx: MergeContext, stats: dict[str, int]
+) -> None:
+    """
+    Remove any already-added rules that are now whitelisted.
+
+    Whitelists apply across ABP, hosts, and plain domains, and they work
+    retroactively: any domain already present in domain_map that matches the
+    whitelist (including wildcard parents) is removed from final output.
+    """
+    hosts_to_fix: set[str] = set()
+    # Iterate over a copy because removals mutate domain_map while we walk it.
+    for dn, entry in list(state.domain_map.items()):
+        if not _domain_is_whitelisted(dn, state.whitelist_domains):
+            continue
+        rule_type, rule_text, _ip = entry
+        if rule_type == "hosts":
+            hosts_to_fix.add(rule_text)
+            continue
+        state.remove_rule(rule_text)
+        state.domain_map.pop(dn, None)
+        if rule_type == "abp":
+            stats["abp_blocks_removed_by_whitelist"] += 1
+        elif rule_type == "plain":
+            stats["plain_removed_by_whitelist"] += 1
+
+    for host_line in hosts_to_fix:
+        ip_val = state.host_line_to_ip.get(host_line, "")
+        hostnames = state.host_line_to_hostnames.get(host_line, [])
+        remaining: list[tuple[str, str]] = []
+        removed_count = 0
+        for raw in hostnames:
+            norm = ctx.normalize(raw)
+            if norm and _domain_is_whitelisted(norm, state.whitelist_domains):
+                removed_count += 1
+                continue
+            if norm:
+                remaining.append((raw, norm))
+
+        state.remove_host_entry(host_line, ctx.normalize)
+
+        if not remaining:
+            if removed_count:
+                stats["hosts_removed_by_whitelist"] += 1
+            continue
+
+        new_line = f"{ip_val} {' '.join(raw for raw, _ in remaining)}"
+        if state.has_seen(new_line):
+            stats["duplicates_removed"] += 1
+            continue
+
+        norms = {n for _, n in remaining if n}
+        state.add_rule(new_line)
+        state.host_line_to_hostnames[new_line] = [raw for raw, _ in remaining]
+        state.host_line_to_hostnames_norm[new_line] = norms
+        state.host_line_to_ip[new_line] = ip_val
+        for _, norm in remaining:
+            state.domain_map[norm] = ("hosts", new_line, ip_val)
 
 
 def handle_hosts_line(
@@ -86,72 +191,93 @@ def handle_hosts_line(
         return True
 
     ip_part = props["ip"]
+    original_hostnames = props["hostnames"]
+    filtered_pairs: list[tuple[str, str]] = []
+    normalized_total = 0
+    whitelist_filtered = 0
+    abp_filtered = 0
+    local_filtered = 0
+    seen_norms: set[str] = set()
+
+    for raw in original_hostnames:
+        norm = ctx.normalize(raw)
+        if not norm or norm in seen_norms:
+            continue
+        seen_norms.add(norm)
+        normalized_total += 1
+        if _domain_is_whitelisted(norm, state.whitelist_domains):
+            whitelist_filtered += 1
+            continue
+        if norm in LOCAL_ONLY_HOSTNAMES:
+            local_filtered += 1
+            continue
+        if ctx.covered_by_abp(norm):
+            abp_filtered += 1
+            continue
+        filtered_pairs.append((raw, norm))
+
+    if not filtered_pairs:
+        if normalized_total == 0:
+            stats["invalid_removed"] += 1
+        elif whitelist_filtered == normalized_total or whitelist_filtered > 0:
+            stats["hosts_removed_by_whitelist"] += 1
+        elif local_filtered == normalized_total:
+            stats["local_hosts_removed"] += 1
+        elif abp_filtered > 0:
+            stats["hosts_removed_by_abp"] += 1
+        else:
+            stats["invalid_removed"] += 1
         return True
+
+    kept_pairs: list[tuple[str, str]] = []
+
+    for raw, norm in filtered_pairs:
+        prev_entry = state.domain_map.get(norm)
+        if not prev_entry:
+            kept_pairs.append((raw, norm))
+            continue
+
+        prev_type, prev_text, _prev_ip = prev_entry
+        if prev_type == "abp":
+            abp_filtered += 1
+            continue
+        if prev_type == "plain":
+            state.remove_rule(prev_text)
+            state.domain_map.pop(norm, None)
+            stats["duplicates_removed"] += 1
+            kept_pairs.append((raw, norm))
+            continue
+        if prev_type == "hosts":
+            stats["duplicates_removed"] += 1
+            continue
+
+        stats["conflicting_hosts_skipped"] += 1
+        continue
+
+    if not kept_pairs:
+        if whitelist_filtered > 0:
+            stats["hosts_removed_by_whitelist"] += 1
+        elif local_filtered > 0:
+            stats["local_hosts_removed"] += 1
+        elif abp_filtered > 0:
+            stats["hosts_removed_by_abp"] += 1
+        else:
+            stats["invalid_removed"] += 1
+        return True
+
+    hostnames = [raw for raw, _ in kept_pairs]
+    hn_norm_set = {norm for _, norm in kept_pairs if norm}
 
     out_line = f"{ip_part} {' '.join(hostnames)}"
     if state.has_seen(out_line):
         stats["duplicates_removed"] += 1
         return True
 
-    skip_line = False
-    will_replace_prev_text: str | None = None
-
-    for single_norm in hn_norm:
-        if not single_norm:
-            continue
-        prev_entry = state.domain_map.get(single_norm)
-        if not prev_entry:
-            continue
-        prev_type, prev_text, prev_ip = prev_entry
-        if prev_type == "abp":
-            skip_line = True
-            stats["hosts_removed_by_abp"] += 1
-            break
-        if prev_type == "plain":
-            state.remove_rule(prev_text)
-            state.domain_map.pop(single_norm, None)
-            stats["duplicates_removed"] += 1
-            continue
-        if prev_type == "hosts":
-            prev_norm_set = state.host_line_to_hostnames_norm.get(prev_text)
-            if prev_norm_set == hn_norm_set:
-                prev_ip_raw = state.host_line_to_ip.get(prev_text, "")
-                prev_ip_canon, prev_unspec, prev_loopback = ctx.canonicalize_ip(
-                    prev_ip_raw
-                )
-                new_ip_canon, new_unspec, new_loopback = ctx.canonicalize_ip(ip_part)
-                if (
-                    prev_ip_canon
-                    and new_ip_canon
-                    and prev_ip_canon == new_ip_canon
-                ):
-                    skip_line = True
-                    stats["duplicates_removed"] += 1
-                    break
-                if prev_unspec and new_loopback:
-                    will_replace_prev_text = prev_text
-                    break
-                skip_line = True
-                break
-            skip_line = True
-            break
-        else:
-            skip_line = True
-            break
-
-    if skip_line:
-        stats["conflicting_hosts_skipped"] += 1
-        return True
-
-    if will_replace_prev_text:
-        state.remove_host_entry(will_replace_prev_text, ctx.normalize)
-        stats["conflicting_hosts_replaced"] += 1
-
     state.add_rule(out_line)
     state.host_line_to_hostnames[out_line] = list(hostnames)
     state.host_line_to_hostnames_norm[out_line] = hn_norm_set
     state.host_line_to_ip[out_line] = ip_part
-    for single_norm in hn_norm:
+    for _, single_norm in kept_pairs:
         if single_norm:
             state.domain_map[single_norm] = ("hosts", out_line, ip_part)
     stats["lines_out"] += 1
@@ -179,21 +305,19 @@ def handle_abp_line(
         dn_norm,
         is_bare_rule=is_bare_rule,
         is_whitelist_rule=is_whitelist_rule,
+        is_wildcard_rule=is_wildcard_subdomain,
         ctx=ctx,
     ):
         stats["abp_subdomains_removed"] += 1
         return True
 
+    # Wildcard subdomains are keyed as "*.domain" so whitelist checks remain consistent.
     map_key = f"*.{dn_norm}" if is_wildcard_subdomain else dn_norm
 
     if is_whitelist_rule:
         state.whitelist_domains.add(map_key)
         stats["abp_whitelists_removed"] += 1
-        prev = state.domain_map.get(map_key)
-        if prev and prev[0] == "abp":
-            state.remove_rule(prev[1])
-            state.domain_map.pop(map_key, None)
-            stats["abp_blocks_removed_by_whitelist"] += 1
+        _apply_whitelist_retroactively(state, ctx, stats)
         return True
 
     prev_entry = state.domain_map.get(map_key)
@@ -356,11 +480,10 @@ def _canonicalize_ip(ip_raw: str) -> tuple[str | None, bool, bool]:
     Return (canonical_ip, is_unspecified, is_loopback).
     Handles zone IDs in IPv6 addresses.
     """
-    # Use utils.canonicalize_ip for basic canonicalization, then add metadata
     canonical = utils.canonicalize_ip(ip_raw)
     if canonical is None:
         return None, False, False
-    
+
     try:
         ip_obj = ipaddress.ip_address(canonical)
         return str(ip_obj), ip_obj.is_unspecified, ip_obj.is_loopback
@@ -371,9 +494,11 @@ def _canonicalize_ip(ip_raw: str) -> tuple[str | None, bool, bool]:
 # ----------------------------------------
 # ABP first-pass collection (optimized single-pass with caching)
 # ----------------------------------------
-def collect_abp_and_cache_lines(input_dir: str) -> tuple[dict[str, set[str]], dict[str, list[str]]]:
+def collect_abp_and_cache_lines(
+    input_dir: str,
+) -> tuple[dict[str, set[str]], dict[str, list[str]]]:
     """Process input files once to collect ABP domains and cache stripped lines.
-    
+
     Returns:
         tuple: (abp_sets, file_lines_cache)
             - abp_sets: {'raw_abp': set, 'abp_minimal': set, 'wildcard_roots': set}
@@ -382,46 +507,40 @@ def collect_abp_and_cache_lines(input_dir: str) -> tuple[dict[str, set[str]], di
     raw_abp = set()
     wildcard_roots = set()
     file_lines_cache = {}
-    
-    # Process each .txt file in the input directory
+
     for file_path in utils.list_text_rule_files(input_dir):
         lines = []
-        with file_path.open(encoding='utf-8-sig', errors='replace') as f:
+        with file_path.open(encoding="utf-8-sig", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 lines.append(line)
-                
+
                 if not line:
                     continue
                 if line.startswith("@@"):
                     continue
-                
-                # Extract domain from ABP-style rules (||example.com^)
+
                 domain = substring_between(line, DOMAIN_PREFIX, DOMAIN_SEPARATOR)
                 if not domain:
                     continue
-                
-                # Handle wildcard patterns
-                if domain.startswith('*.'):
+
+                if domain.startswith("*."):
                     base = domain[2:]
                     norm_base = normalize_domain_token(base)
                     if norm_base:
                         wildcard_roots.add(norm_base)
                     continue
-                
-                # Process regular domains
+
                 norm_domain = normalize_domain_token(domain)
                 if norm_domain:
                     raw_abp.add(norm_domain)
-        
-        # Cache the file contents for later processing
+
         file_lines_cache[file_path.name] = lines
-    
-    # Return both the raw domains and the minimal covering set
+
     return {
-        'raw_abp': raw_abp,
-        'abp_minimal': minimal_covering_set(raw_abp),
-        'wildcard_roots': wildcard_roots,
+        "raw_abp": raw_abp,
+        "abp_minimal": minimal_covering_set(raw_abp),
+        "wildcard_roots": wildcard_roots,
     }, file_lines_cache
 
 
@@ -434,7 +553,6 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
     if not in_path.is_dir():
         raise FileNotFoundError(f"Input directory not found: {input_dir}")
 
-    # Single-pass: collect ABP sets and cache all file lines
     abp_sets, file_lines_cache = collect_abp_and_cache_lines(input_dir)
     abp_minimal = abp_sets["abp_minimal"]
     abp_wildcards = abp_sets["wildcard_roots"]
@@ -466,7 +584,6 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
         "local_hosts_removed": 0,
     }
 
-    # Local refs for speed on big lists
     normalize = normalize_domain_token
     domain_regex = utils.DOMAIN_REGEX
     is_hosts_re = utils.is_etc_hosts_rule
@@ -474,6 +591,7 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
     canonicalize_ip = _canonicalize_ip
     re_abp_bare = utils.ABP_HOSTNAME_RE
 
+    # Precompute minimal covering sets so handlers can do fast redundancy checks.
     plain_minimal = build_plain_domain_minimal_set(
         file_lines_cache, normalize, domain_regex, is_hosts_re, _covered_by_abp
     )
@@ -490,9 +608,6 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
     )
     state = MergeState()
 
-    # ------------------------------
-    # Process cached file lines (no re-reading files)
-    # ------------------------------
     for filename in sorted(file_lines_cache.keys(), key=lambda n: n.lower()):
         lines = file_lines_cache[filename]
         stats["files"] += 1
@@ -517,14 +632,10 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
 
             handle_other_line(line, state, stats)
 
-    # ----------------------------------------
-    # Atomic write output (write in insertion order, avoid global sort)
-    # ----------------------------------------
     out_path = Path(merged_out)
     out_dir = out_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write main blocklist
     tmp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -534,10 +645,9 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
             dir=out_dir,
             prefix=".tmp_merged_",
             delete=False,
-            buffering=IO_BUFFER_SIZE,  # 128KB buffer optimized for modern SSDs
+            buffering=IO_BUFFER_SIZE,
         ) as tmp_file:
             tmp_path = Path(tmp_file.name)
-            # write rules in insertion order (no costly sort on very large sets)
             for r in state.final_rules:
                 tmp_file.write(r + "\n")
             tmp_file.flush()
@@ -553,9 +663,6 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
     return stats
 
 
-# ----------------------------------------
-# Summary printer
-# ----------------------------------------
 def _print_summary(stats: dict[str, int]) -> None:
     print(
         "merge_and_classify: "
@@ -576,9 +683,6 @@ def _print_summary(stats: dict[str, int]) -> None:
     )
 
 
-# ----------------------------------------
-# CLI entrypoint
-# ----------------------------------------
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         print(

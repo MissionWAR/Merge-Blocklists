@@ -18,6 +18,7 @@ Usage:
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -136,10 +137,25 @@ def transform(input_dir: str, output_file: str) -> None:
                 f"[Pipeline] Cached intermediates reused: {reused}/{total_files} files"
             )
 
-        merged_file = tmp / "merged.txt"
-        run_stage(merge_and_classify, validated_dir, merged_file, "Merging and deduplicating")
+        merge_parent = out_path.parent
+        fd, merge_name = tempfile.mkstemp(
+            prefix=".tmp_pipeline_", suffix=".txt", dir=merge_parent
+        )
+        os.close(fd)
+        merge_target = Path(merge_name)
+        try:
+            merge_target.unlink(missing_ok=True)
+        except Exception:
+            pass
 
-        merged_file.replace(out_path)
+        run_stage(
+            merge_and_classify,
+            validated_dir,
+            merge_target,
+            "Merging and deduplicating",
+        )
+
+        merge_target.replace(out_path)
         print(f"[Pipeline] Successfully saved output to: {out_path}")
 
 

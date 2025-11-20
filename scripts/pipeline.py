@@ -66,7 +66,12 @@ def _clean_and_validate_with_cache(
     validated_dir: Path,
     cache: IntermediateResultCache,
 ) -> tuple[list[dict[str, int | str]], list[dict[str, int | str]], int]:
-    """Clean + validate inputs while persisting intermediates (cache-aware by design)."""
+    """
+    Clean + validate inputs while persisting intermediates (cache-aware by design).
+
+    Returns per-stage stats along with a reuse counter indicating how many files
+    were restored directly from the intermediate cache (those files skip re-run).
+    """
     clean_stats: list[dict[str, int | str]] = []
     validate_stats: list[dict[str, int | str]] = []
     reused = 0

@@ -49,6 +49,15 @@ jobs:
           echo "✅ Dependencies installed"
 
       # ============================================
+      # Cache slot (weekly)
+      # ============================================
+      - name: Compute cache slot (weekly)
+        id: cache-slot
+        run: |
+          # ISO year-week, for example: 2025-07
+          echo "CACHE_SLOT=$(date -u +%G-%V)" >> $GITHUB_ENV
+
+      # ============================================
       # Caching
       # ============================================
       - name: Restore blocklist caches
@@ -57,10 +66,10 @@ jobs:
           path: |
             .cache
             .pipeline_cache
-          # Invalidate caches when sources or core scripts change
-          key: blocklists-cache-${{ hashFiles('sources.txt', 'scripts/remove_comments.py', 'scripts/validate.py', 'scripts/merge_and_classify.py', 'scripts/utils.py', 'scripts/fetch_sources.py', 'scripts/pipeline.py') }}
+          # Weekly cache prefix + per-run key, so cache can evolve within the week
+          key: blocklists-cache-v1-${{ env.CACHE_SLOT }}-${{ github.run_id }}
           restore-keys: |
-            blocklists-cache-
+            blocklists-cache-v1-${{ env.CACHE_SLOT }}-
 
       # ============================================
       # Fetch & Process

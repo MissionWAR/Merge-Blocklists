@@ -212,7 +212,7 @@ class CacheManager:
 # Intermediate pipeline cache helpers
 # ----------------------------------------
 def hash_file(path: str | Path) -> str:
-    """Return SHA256 hash of the given file."""
+    """Return SHA256 hash of the given file using the shared IO buffer size."""
     digest = hashlib.sha256()
     path_obj = Path(path)
     with path_obj.open("rb") as fh:
@@ -375,4 +375,5 @@ class IntermediateResultCache:
         self.save()
 
     def raw_hash(self, path: str | Path) -> str:
+        """Compute the raw file hash used as the cache-key fingerprint."""
         return hash_file(path)

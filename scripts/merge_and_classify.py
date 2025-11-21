@@ -144,6 +144,30 @@ def _has_parent_cached(domain: str, domain_set: set[str]) -> bool:
             return True
     return False
 
+# compatibility shim for legacy tests
+_walk_suffixes = utils.walk_suffixes
+
+
+LOCAL_ONLY_HOSTNAMES = {
+    "localhost",
+    "localhost.localdomain",
+    "localhost4",
+    "localhost4.localdomain4",
+    "localhost6",
+    "localhost6.localdomain6",
+    "localdomain",
+    "localdomain.localhost",
+    "local",
+    "ip6-localhost",
+    "ip6-loopback",
+    "ip6-localnet",
+    "ip6-mcastprefix",
+    "ip6-allnodes",
+    "ip6-allrouters",
+    "ip6-allhosts",
+    "broadcasthost",
+}
+
 
 def _is_bare_abp_rule(
     rule_text: str, is_wildcard_subdomain: bool, re_abp_bare: Pattern[str]
@@ -181,8 +205,93 @@ def _abp_rule_is_redundant(
     # wildcard redundant if its parent apex rule already exists
     if is_wildcard_rule and domain_norm in ctx.abp_minimal:
         return True
+    # wildcard redundant if its parent apex rule already exists
+    if is_wildcard_rule and domain_norm in ctx.abp_minimal:
+        return True
     # Wildcard coverage: honours that '*.example.com' does not cover the apex domain
     return ctx.wildcard_covered(domain_norm)
+
+
+def _domain_is_whitelisted(domain: str, whitelist: set[str]) -> bool:
+    """
+    Return True if `domain` or any parent/wildcard is whitelisted.
+
+    Wildcards in the whitelist (e.g., '*.example.com') intentionally cover
+    every subdomain but not the apex; walk_suffixes keeps that behaviour visible.
+    """
+    if not domain or not whitelist:
+        return False
+    if domain in whitelist:
+        return True
+    for suffix in walk_suffixes(domain):
+        if suffix == domain:
+            continue
+        if suffix in whitelist:
+            return True
+        wildcard_key = f"*.{suffix}"
+        if wildcard_key in whitelist:
+            return True
+    return False
+
+
+def _apply_whitelist_retroactively(
+    state: MergeState, ctx: MergeContext, stats: dict[str, int]
+) -> None:
+    """
+    Remove any already-added rules that are now whitelisted.
+
+    Whitelists apply across ABP, hosts, and plain domains, and they work
+    retroactively: any domain already present in domain_map that matches the
+    whitelist (including wildcard parents) is removed from final output.
+    """
+    hosts_to_fix: set[str] = set()
+    # Iterate over a copy because removals mutate domain_map while we walk it.
+    for dn, entry in list(state.domain_map.items()):
+        if not _domain_is_whitelisted(dn, state.whitelist_domains):
+            continue
+        rule_type, rule_text, _ip = entry
+        if rule_type == "hosts":
+            hosts_to_fix.add(rule_text)
+            continue
+        state.remove_rule(rule_text)
+        state.domain_map.pop(dn, None)
+        if rule_type == "abp":
+            stats["abp_blocks_removed_by_whitelist"] += 1
+        elif rule_type == "plain":
+            stats["plain_removed_by_whitelist"] += 1
+
+    for host_line in hosts_to_fix:
+        ip_val = state.host_line_to_ip.get(host_line, "")
+        hostnames = state.host_line_to_hostnames.get(host_line, [])
+        remaining: list[tuple[str, str]] = []
+        removed_count = 0
+        for raw in hostnames:
+            norm = ctx.normalize(raw)
+            if norm and _domain_is_whitelisted(norm, state.whitelist_domains):
+                removed_count += 1
+                continue
+            if norm:
+                remaining.append((raw, norm))
+
+        state.remove_host_entry(host_line, ctx.normalize)
+
+        if not remaining:
+            if removed_count:
+                stats["hosts_removed_by_whitelist"] += 1
+            continue
+
+        new_line = f"{ip_val} {' '.join(raw for raw, _ in remaining)}"
+        if state.has_seen(new_line):
+            stats["duplicates_removed"] += 1
+            continue
+
+        norms = {n for _, n in remaining if n}
+        state.add_rule(new_line)
+        state.host_line_to_hostnames[new_line] = [raw for raw, _ in remaining]
+        state.host_line_to_hostnames_norm[new_line] = norms
+        state.host_line_to_ip[new_line] = ip_val
+        for _, norm in remaining:
+            state.domain_map[norm] = ("hosts", new_line, ip_val)
 
 
 def handle_hosts_line(

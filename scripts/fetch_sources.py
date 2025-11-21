@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import hashlib
 import json
 import os
 import random
+import re
 import shutil
 import sys
 import time
@@ -51,6 +53,13 @@ DEFAULT_PER_HOST_DELAY = 0.2  # seconds
 # ----------------------------------------
 # Helpers
 # ----------------------------------------
+def _backoff_delay(attempt: int) -> float:
+    """Return capped exponential backoff with small jitter (10s max)."""
+    base = 0.5 * (2 ** (attempt - 1))
+    jitter = random.uniform(0, base * 0.1)
+    return min(base + jitter, 10.0)
+
+
 def _get_origin(url: str) -> str:
     """Return canonical origin (scheme://host[:port]) for rate limiting."""
     p = urlparse(url)
@@ -253,6 +262,53 @@ def _log_diff_failure(url: str, reason: str) -> None:
     print(f"[diffupdates] {url}: {reason}", file=sys.stderr)
 
 
+def _log_checksum_mismatch(url: str, reason: str) -> None:
+    """Log checksum mismatch warnings in a consistent format."""
+    print(f"[checksum] {url}: {reason}", file=sys.stderr)
+
+
+_CHECKSUM_LINE_RE = re.compile(r"^!\s*checksum:\s*\S+", re.IGNORECASE | re.MULTILINE)
+
+
+def _compute_checksum_candidates(content: str) -> set[str]:
+    """
+    Return a small set of plausible Adblock/AdGuard checksum values for `content`.
+
+    The checksum used by most filter lists is the base64-encoded MD5 of the list
+    with any existing `! Checksum:` line removed. We try a handful of safe
+    normalizations (CR removal, collapsing repeated newlines, trimming padding)
+    to tolerate minor upstream variations.
+    """
+    variants: set[str] = set()
+
+    def _md5_b64(text: str) -> str:
+        digest = hashlib.md5(text.encode("utf-8")).digest()
+        return base64.b64encode(digest).decode("ascii").rstrip("=")
+
+    stripped = _CHECKSUM_LINE_RE.sub("", content)
+    bases = {
+        content,
+        stripped,
+        content.replace("\r", ""),
+        stripped.replace("\r", ""),
+    }
+    for base in bases:
+        normalized = re.sub(r"\n+", "\n", base)
+        for candidate in {base, normalized}:
+            variants.add(_md5_b64(candidate))
+            variants.add(_md5_b64(candidate.rstrip("\n")))
+
+    return {v for v in variants if v}
+
+
+def _checksum_matches(content: str, expected: str | None) -> bool:
+    """Return True if the computed checksum variants match `expected`."""
+    if not expected:
+        return True
+    expected_clean = expected.strip().rstrip("=")
+    return expected_clean in _compute_checksum_candidates(content)
+
+
 async def _download_patch_text(
     session: aiohttp.ClientSession,
     patch_url: str,
@@ -295,6 +351,7 @@ async def _try_diff_update(
     cache: CacheManager,
     cached_file: Path,
     diff_path: str,
+    expected_checksum: str | None,
     dest_path: Path,
     timeout: int,
     per_host_delay: float,
@@ -335,6 +392,13 @@ async def _try_diff_update(
         return False
     except Exception as exc:
         _log_diff_failure(url, f"patch apply error: {exc}")
+        return False
+
+    if expected_checksum and not _checksum_matches(patched_text, expected_checksum):
+        _log_diff_failure(
+            url,
+            "checksum mismatch after diff patch; requesting full download",
+        )
         return False
 
     tmp = cached_file.with_suffix(".part")
@@ -426,8 +490,11 @@ async def fetch_one(
     diff_path = None
     if cached_file:
         diff_path = header_directives.get("diff-path") or meta.get("diff_path")
+    expected_checksum = (
+        header_directives.get("checksum") or meta.get("list_checksum")
+    )
 
-    # Track per-origin delay in session object
+    # Track per-origin delay in session object so concurrent coroutines share pacing
     if not hasattr(session, "_host_last_times"):
         session._host_last_times = {}  # type: ignore
     host_last_times: dict[str, float] = session._host_last_times  # type: ignore
@@ -439,6 +506,7 @@ async def fetch_one(
             cache,
             cached_file,
             diff_path,
+            expected_checksum,
             dest_path,
             timeout,
             per_host_delay,
@@ -525,13 +593,36 @@ async def fetch_one(
                         fh.write(chunk)
                         hasher.update(chunk)
 
+                try:
+                    content_text = tmp.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    content_text = ""
+
+                directives = _parse_filter_headers(tmp)
+                expected = directives.get("checksum")
+                if expected and content_text and not _checksum_matches(
+                    content_text, expected
+                ):
+                    _log_checksum_mismatch(url, "checksum mismatch after download")
+                    try:
+                        tmp.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    if cached_file and cached_file.exists():
+                        _sync_cache_to_dest(cached_file, dest_path)
+                        return (
+                            "used-cache-on-fail",
+                            url,
+                            "checksum mismatch; kept cached copy",
+                        )
+                    return "failed", url, "checksum mismatch"
+
                 # atomic replace cached file
                 tmp.replace(cache_path)
 
                 resp_etag = resp.headers.get("ETag")
                 resp_last_modified = resp.headers.get("Last-Modified")
                 content_sha = hasher.hexdigest()
-                directives = _parse_filter_headers(cache_path)
                 header_meta = _header_meta_from_directives(directives)
 
                 cache.record_fetch(
@@ -551,17 +642,13 @@ async def fetch_one(
         except asyncio.TimeoutError:
             last_exc = Exception("Timeout - server did not respond in time")
             if attempt <= retries:
-                base = 0.5 * (2 ** (attempt - 1))
-                jitter = random.uniform(0, base * 0.1)
-                await asyncio.sleep(min(base + jitter, 10.0))
+                await asyncio.sleep(_backoff_delay(attempt))
                 continue
             break
         except aiohttp.ClientConnectionError as ex:
             last_exc = Exception(f"Connection error - {type(ex).__name__}")
             if attempt <= retries:
-                base = 0.5 * (2 ** (attempt - 1))
-                jitter = random.uniform(0, base * 0.1)
-                await asyncio.sleep(min(base + jitter, 10.0))
+                await asyncio.sleep(_backoff_delay(attempt))
                 continue
             break
         except aiohttp.ClientSSLError as ex:
@@ -571,9 +658,7 @@ async def fetch_one(
         except Exception as ex:
             last_exc = ex
             if attempt <= retries:
-                base = 0.5 * (2 ** (attempt - 1))
-                jitter = random.uniform(0, base * 0.1)
-                await asyncio.sleep(min(base + jitter, 10.0))
+                await asyncio.sleep(_backoff_delay(attempt))
                 continue
             break
 

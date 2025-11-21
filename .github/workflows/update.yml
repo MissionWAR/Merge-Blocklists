@@ -65,9 +65,8 @@ jobs:
         with:
           path: |
             .cache
-            .pipeline_cache
-          # Weekly cache prefix + per-run key, so cache can evolve within the week
-          key: blocklists-cache-v1-${{ env.CACHE_SLOT }}-${{ github.run_id }}
+          # Weekly cache prefix so runs within the same week share a single cache artifact
+          key: blocklists-cache-v1-${{ env.CACHE_SLOT }}
           restore-keys: |
             blocklists-cache-v1-${{ env.CACHE_SLOT }}-
 
@@ -79,6 +78,8 @@ jobs:
         run: |
           set -euo pipefail
           echo "🔄 Fetching blocklists from sources..."
+
+          fetch_start=$(date +%s)
           
           python -m scripts.fetch_sources \
             --sources sources.txt \
@@ -87,6 +88,9 @@ jobs:
             --concurrency "${{ env.FETCH_CONCURRENCY }}" \
             --retries "${{ env.FETCH_RETRIES }}" \
             --timeout "${{ env.FETCH_TIMEOUT }}"
+
+          fetch_end=$(date +%s)
+          echo "fetch_seconds=$((fetch_end - fetch_start))" >> $GITHUB_OUTPUT
           
           # Count fetched files
           RAW_COUNT=$(find "${{ env.RAW_OUT }}" -type f -name "*.txt" | wc -l)
@@ -98,9 +102,14 @@ jobs:
         run: |
           set -euo pipefail
           echo "⚙️ Processing through pipeline..."
+
+          pipeline_start=$(date +%s)
           
           # Run the full pipeline (uses .pipeline_cache internally when available)
           python -m scripts.pipeline "${{ env.RAW_OUT }}" "${{ env.MERGED_OUT }}"
+
+          pipeline_end=$(date +%s)
+          echo "pipeline_seconds=$((pipeline_end - pipeline_start))" >> $GITHUB_OUTPUT
           
           # Verify output exists
           if [ ! -f "${{ env.MERGED_OUT }}" ]; then
@@ -213,6 +222,8 @@ jobs:
           | Total Rules | ${{ steps.stats.outputs.total_rules || 'N/A' }} |
           | File Size | ${{ steps.stats.outputs.file_size || 'N/A' }} |
           | Sources Fetched | ${{ steps.fetch.outputs.raw_files || 'N/A' }} |
+          | Fetch Duration (s) | ${{ steps.fetch.outputs.fetch_seconds || 'N/A' }} |
+          | Pipeline Duration (s) | ${{ steps.pipeline.outputs.pipeline_seconds || 'N/A' }} |
           
           ## Timestamps
           - **Started**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')

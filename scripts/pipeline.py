@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,14 @@ def _cache_dir_for_input(inp: Path) -> Path:
     return inp / INTERMEDIATE_CACHE_DIR_NAME
 
 
+def _process_clean_validate_job(args: tuple[str, str, str]) -> tuple[dict[str, int | str], dict[str, int | str]]:
+    """Worker to run remove_comments + validate for a single file."""
+    src, cleaned_dest, validated_dest = args
+    clean_result = remove_comments.process_file(src, cleaned_dest)
+    validate_result = validate.process_file(cleaned_dest, validated_dest)
+    return clean_result, validate_result
+
+
 def _clean_and_validate_with_cache(
     files: list[Path],
     inp_root: Path,
@@ -79,6 +88,9 @@ def _clean_and_validate_with_cache(
     cleaned_dir.mkdir(parents=True, exist_ok=True)
     validated_dir.mkdir(parents=True, exist_ok=True)
 
+    jobs: list[tuple[str, str, str]] = []
+    job_meta: list[tuple[str, str, Path, Path]] = []
+
     for src in files:
         rel_path = src.relative_to(inp_root)
         rel_key = rel_path.as_posix()
@@ -92,17 +104,38 @@ def _clean_and_validate_with_cache(
             reused += 1
             continue
 
-        clean_stats.append(remove_comments.process_file(src, cleaned_dest))
-        validate_stats.append(
-            validate.process_file(str(cleaned_dest), str(validated_dest))
-        )
-        try:
-            cache.store_result(rel_key, raw_hash, cleaned_dest, validated_dest)
-        except Exception as exc:  # best-effort cache persistence
-            print(
-                f"[Pipeline] Warning: failed to cache intermediates for {rel_key}: {exc}",
-                file=sys.stderr,
-            )
+        jobs.append((str(src), str(cleaned_dest), str(validated_dest)))
+        job_meta.append((rel_key, raw_hash, cleaned_dest, validated_dest))
+
+    if jobs:
+        max_workers = min(os.cpu_count() or 1, len(jobs))
+        if len(jobs) == 1:
+            clean_result, validate_result = _process_clean_validate_job(jobs[0])
+            clean_stats.append(clean_result)
+            validate_stats.append(validate_result)
+            rel_key, raw_hash, cleaned_dest, validated_dest = job_meta[0]
+            try:
+                cache.store_result(rel_key, raw_hash, cleaned_dest, validated_dest)
+            except Exception as exc:
+                print(
+                    f"[Pipeline] Warning: failed to cache intermediates for {rel_key}: {exc}",
+                    file=sys.stderr,
+                )
+        else:
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                for (clean_result, validate_result), meta in zip(
+                    executor.map(_process_clean_validate_job, jobs), job_meta
+                ):
+                    clean_stats.append(clean_result)
+                    validate_stats.append(validate_result)
+                    rel_key, raw_hash, cleaned_dest, validated_dest = meta
+                    try:
+                        cache.store_result(rel_key, raw_hash, cleaned_dest, validated_dest)
+                    except Exception as exc:
+                        print(
+                            f"[Pipeline] Warning: failed to cache intermediates for {rel_key}: {exc}",
+                            file=sys.stderr,
+                        )
 
     return clean_stats, validate_stats, reused
 

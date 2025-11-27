@@ -7,9 +7,10 @@ Strip comments and blank lines from blocklists.
 Usage:
     python -m scripts.remove_comments INPUT OUTPUT
 """
+
 from __future__ import annotations
 
-import multiprocessing as mp
+import logging
 import sys
 import tempfile
 from os import PathLike
@@ -23,6 +24,11 @@ IO_BUFFER_SIZE = utils.IO_BUFFER_SIZE
 # Use utils implementations for consistency
 _find_unescaped_char = utils.find_unescaped_char
 _ELEMENT_HIDING_PATTERN = utils.ELEMENT_HIDING_PATTERN_RE  # Shared precompiled regex
+logging.basicConfig(
+    level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s"
+)
+logger = logging.getLogger(__name__)
+RC_KEYS = utils.REMOVE_COMMENTS_STATS_KEYS
 
 
 def _contains_element_hiding_marker(s: str) -> bool:
@@ -88,7 +94,7 @@ def _process_raw_line(raw_line: str) -> tuple[str | None, bool, str | None]:
     Process a raw input line and return (cleaned_line, trimmed_flag, dropped_kind).
     dropped_kind ∈ {"empty", "comment", "empty_after_strip", None}.
     """
-    # remove only newline characters here; we'll normalize other whitespace with .strip()
+    # remove only newline chars; normalize other whitespace with .strip()
     raw_no_nl = raw_line.rstrip("\r\n")
     trimmed = raw_no_nl.strip()
     trimmed_flag = trimmed != raw_no_nl
@@ -116,11 +122,11 @@ def process_file(in_path: PathLike, out_path: PathLike) -> dict[str, int | str]:
     stats: dict[str, int | str] = {
         "in_path": str(in_path_p),
         "out_path": str(out_path_p),
-        "lines_in": 0,
-        "lines_out": 0,
-        "trimmed": 0,
-        "dropped_comments": 0,
-        "dropped_empty": 0,
+        RC_KEYS.LINES_IN: 0,
+        RC_KEYS.LINES_OUT: 0,
+        RC_KEYS.TRIMMED: 0,
+        RC_KEYS.DROPPED_COMMENTS: 0,
+        RC_KEYS.DROPPED_EMPTY: 0,
     }
 
     # Ensure output parent dir exists
@@ -141,29 +147,32 @@ def process_file(in_path: PathLike, out_path: PathLike) -> dict[str, int | str]:
         ) as tmp_file:
             tmp_path = Path(tmp_file.name)
             with in_path_p.open(
-                "r", encoding="utf-8", errors="surrogateescape", buffering=IO_BUFFER_SIZE
+                "r",
+                encoding="utf-8",
+                errors="surrogateescape",
+                buffering=IO_BUFFER_SIZE,
             ) as inp:
                 for raw in inp:
-                    stats["lines_in"] += 1
+                    stats[RC_KEYS.LINES_IN] += 1
                     cleaned, trimmed_flag, dropped_kind = _process_raw_line(raw)
-                    
+
                     # Track if line had whitespace trimmed
                     if trimmed_flag:
-                        stats["trimmed"] += 1
-                    
+                        stats[RC_KEYS.TRIMMED] += 1
+
                     # Skip lines that should be dropped
                     if dropped_kind == "comment":
-                        stats["dropped_comments"] += 1
+                        stats[RC_KEYS.DROPPED_COMMENTS] += 1
                         continue
                     if dropped_kind in ("empty", "empty_after_strip"):
-                        stats["dropped_empty"] += 1
+                        stats[RC_KEYS.DROPPED_EMPTY] += 1
                         continue
-                    
+
                     # Write valid lines (cleaned is guaranteed non-None here)
                     tmp_file.write(cleaned + "\n")
-                    stats["lines_out"] += 1
+                    stats[RC_KEYS.LINES_OUT] += 1
             tmp_file.flush()
-            # NOTE: leaving replace() as-is (atomic rename) — this is POSIX-safe for GitHub runners.
+            # NOTE: replace() provides atomic rename; POSIX-safe for GitHub runners.
             tmp_path.replace(out_path_p)
     except Exception:
         if tmp_path and tmp_path.exists():
@@ -177,6 +186,11 @@ def _process_file_worker(args: tuple[Path, Path]) -> dict[str, int | str]:
     """Worker function for parallel processing."""
     in_path, out_path = args
     return process_file(in_path, out_path)
+
+
+def _build_job_args(in_path: Path, out_path: Path) -> tuple[Path, Path]:
+    """Return argument tuple for the worker (preserves type for pickling)."""
+    return in_path, out_path
 
 
 def transform(
@@ -193,57 +207,28 @@ def transform(
     """
     inp = Path(input_path)
     out = Path(output_path)
-    results: list[dict[str, int | str]] = []
-
     if inp.is_dir():
         out.mkdir(parents=True, exist_ok=True)
-        
-        # Collect all files to process
-        files_to_process = [
-            (entry, out / entry.name) for entry in utils.list_text_rule_files(inp)
-        ]
-        
-        if not files_to_process:
-            return results
-        
-        # Use parallel processing if enabled and multiple files
-        if parallel and len(files_to_process) > 1:
-            # Use all available CPU cores (no artificial cap)
-            num_workers = min(mp.cpu_count(), len(files_to_process))
-            with mp.Pool(processes=num_workers) as pool:
-                results = pool.map(_process_file_worker, files_to_process)
-        else:
-            # Sequential processing (single file or parallel disabled)
-            for in_path, out_path in files_to_process:
-                results.append(process_file(in_path, out_path))
-                
-    elif inp.is_file():
-        dest = out / inp.name if out.is_dir() else out
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        results.append(process_file(inp, dest))
-    else:
-        raise FileNotFoundError(f"Input path not found: {input_path}")
-
-    return results
+    return utils.process_text_rule_files(
+        inp,
+        out,
+        job_builder=_build_job_args,
+        worker=_process_file_worker,
+        parallel=parallel,
+    )
 
 
 def _print_summary(stats_list: list[dict[str, int | str]]) -> None:
     """Print aggregate statistics for all processed files."""
-    total_in = sum(s["lines_in"] for s in stats_list)
-    total_out = sum(s["lines_out"] for s in stats_list)
-    total_trimmed = sum(s["trimmed"] for s in stats_list)
-    total_comments = sum(s["dropped_comments"] for s in stats_list)
-    total_empty = sum(s["dropped_empty"] for s in stats_list)
-    print(
-        f"remove_comments: files={len(stats_list)} "
-        f"lines_in={total_in} lines_out={total_out} "
-        f"trimmed={total_trimmed} dropped_comments={total_comments} dropped_empty={total_empty}"
+    summary = utils.format_summary(
+        "remove_comments", stats_list, utils.REMOVE_COMMENTS_SUMMARY_ORDER
     )
+    logger.info(summary)
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python -m scripts.remove_comments INPUT OUTPUT")
+        logger.error("Usage: python -m scripts.remove_comments INPUT OUTPUT")
         sys.exit(2)
 
     input_path_arg = sys.argv[1]
@@ -253,5 +238,5 @@ if __name__ == "__main__":
         stats = transform(input_path_arg, output_path_arg)
         _print_summary(stats)
     except Exception as exc:
-        print(f"ERROR in remove_comments: {exc}", file=sys.stderr)
+        logger.exception("ERROR in remove_comments: %s", exc)
         sys.exit(1)

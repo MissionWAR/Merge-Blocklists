@@ -45,9 +45,11 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import multiprocessing as mp
 import re
 import sys
 import tempfile
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 from scripts import utils
@@ -643,8 +645,9 @@ def _transform_internal(
     input_path: str, output_path: str, allow_ip: bool, parallel: bool = True
 ) -> list[dict[str, int | str]]:
     """
-    Internal transform helper handling file/directory inputs.
-    
+    Internal transform helper handling file/directory inputs without relying on
+    shared utils helpers (keeps validate usable as a standalone CLI).
+
     Args:
         input_path: Input file or directory
         output_path: Output file or directory
@@ -653,19 +656,37 @@ def _transform_internal(
     """
     inp = Path(input_path)
     outp = Path(output_path)
+    results: list[dict[str, int | str]] = []
+
     if inp.is_dir():
         outp.mkdir(parents=True, exist_ok=True)
+        files = utils.list_text_rule_files(inp)
+        if not files:
+            return results
 
-    def _job_builder(src: Path, dest: Path) -> tuple[str, str, bool]:
-        return str(src), str(dest), allow_ip
+        jobs: list[tuple[str, str, bool]] = []
+        for src in files:
+            dest = outp / src.name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            jobs.append((str(src), str(dest), allow_ip))
 
-    return utils.process_text_rule_files(
-        inp,
-        outp,
-        job_builder=_job_builder,
-        worker=_process_file_worker,
-        parallel=parallel,
-    )
+        if parallel and len(jobs) > 1:
+            max_workers = min(mp.cpu_count() or 1, len(jobs))
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                for res in executor.map(_process_file_worker, jobs):
+                    results.append(res)
+        else:
+            for job in jobs:
+                results.append(_process_file_worker(job))
+
+        return results
+
+    if inp.is_file():
+        dest = outp / inp.name if outp.is_dir() else outp
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        return [process_file(str(inp), str(dest), allow_ip)]
+
+    raise FileNotFoundError(f"Input path not found: {input_path}")
 
 
 def transform(input_path: str, output_path: str) -> list[dict[str, int | str]]:

@@ -11,10 +11,12 @@ Usage:
 from __future__ import annotations
 
 import logging
+import multiprocessing as mp
 import sys
 import tempfile
 from os import PathLike
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor
 
 from scripts import utils
 
@@ -188,11 +190,6 @@ def _process_file_worker(args: tuple[Path, Path]) -> dict[str, int | str]:
     return process_file(in_path, out_path)
 
 
-def _build_job_args(in_path: Path, out_path: Path) -> tuple[Path, Path]:
-    """Return argument tuple for the worker (preserves type for pickling)."""
-    return in_path, out_path
-
-
 def transform(
     input_path: PathLike, output_path: PathLike, parallel: bool = True
 ) -> list[dict[str, int | str]]:
@@ -207,15 +204,37 @@ def transform(
     """
     inp = Path(input_path)
     out = Path(output_path)
+    results: list[dict[str, int | str]] = []
+
     if inp.is_dir():
         out.mkdir(parents=True, exist_ok=True)
-    return utils.process_text_rule_files(
-        inp,
-        out,
-        job_builder=_build_job_args,
-        worker=_process_file_worker,
-        parallel=parallel,
-    )
+        files = utils.list_text_rule_files(inp)
+        if not files:
+            return results
+
+        jobs: list[tuple[Path, Path]] = []
+        for src in files:
+            dest = out / src.name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            jobs.append((src, dest))
+
+        if parallel and len(jobs) > 1:
+            max_workers = min(mp.cpu_count() or 1, len(jobs))
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                for res in executor.map(_process_file_worker, jobs):
+                    results.append(res)
+        else:
+            for job in jobs:
+                results.append(_process_file_worker(job))
+
+        return results
+
+    if inp.is_file():
+        dest = out / inp.name if out.is_dir() else out
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        return [process_file(inp, dest)]
+
+    raise FileNotFoundError(f"Input path not found: {input_path}")
 
 
 def _print_summary(stats_list: list[dict[str, int | str]]) -> None:

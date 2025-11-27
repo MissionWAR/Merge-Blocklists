@@ -9,6 +9,7 @@ Usage:
 """
 from __future__ import annotations
 
+import logging
 import ipaddress
 import sys
 import tempfile
@@ -18,6 +19,11 @@ from pathlib import Path
 from typing import Callable, Pattern
 
 from scripts import utils
+
+logging.basicConfig(
+    level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s"
+)
+logger = logging.getLogger(__name__)
 
 
 # ----------------------------------------
@@ -109,19 +115,54 @@ def _make_whitelist_checker(whitelist: set[str]) -> Callable[[str], bool]:
     return _is_whitelisted
 
 
+def _make_abp_whitelist_matcher(whitelist: set[str]) -> Callable[[str], bool]:
+    """
+    Return predicate that reports explicit ABP whitelist matches.
+
+    Coverage is restricted to exact domains or wildcard whitelist entries
+    (e.g., @@||*.example.com^) so parent allowlists do not implicitly
+    whitelist subdomains for block redundancy checks.
+    """
+    if not whitelist:
+        return lambda _domain: False
+
+    whitelist_lookup = frozenset(whitelist)
+
+    @lru_cache(maxsize=131072)
+    def _matches(domain: str) -> bool:
+        if not domain:
+            return False
+        if domain in whitelist_lookup:
+            return True
+        for suffix in _cached_suffixes(domain):
+            wildcard_key = f"*.{suffix}"
+            if wildcard_key in whitelist_lookup:
+                return True
+        return False
+
+    return _matches
+
+
 def _make_abp_coverage_checker(
-    abp_minimal: set[str], wildcard_checker: Callable[[str], bool]
+    abp_minimal: set[str],
+    wildcard_checker: Callable[[str], bool],
+    abp_whitelist_match: Callable[[str], bool],
 ) -> Callable[[str], bool]:
     """Return cached predicate that checks ABP coverage (roots + wildcards)."""
     abp_lookup = frozenset(abp_minimal)
 
     @lru_cache(maxsize=131072)
     def _covered(domain: str) -> bool:
-        if not domain:
+        if not domain or abp_whitelist_match(domain):
             return False
-        if abp_lookup and any(parent in abp_lookup for parent in _cached_suffixes(domain)):
-            return True
-        return wildcard_checker(domain)
+        if abp_lookup:
+            for parent in _cached_suffixes(domain):
+                if parent == domain:
+                    continue
+                if parent in abp_lookup and not abp_whitelist_match(parent):
+                    return True
+        covered_by_wildcard = wildcard_checker(domain)
+        return covered_by_wildcard and not abp_whitelist_match(domain)
 
     return _covered
 
@@ -175,14 +216,21 @@ def _abp_rule_is_redundant(
     """
     if is_whitelist_rule or not is_bare_rule or not domain_norm:
         return False
-    # Parent coverage: `has_parent` only succeeds for strict parents (not the domain itself)
-    if _has_parent_cached(domain_norm, ctx.abp_minimal):
-        return True
-    # wildcard redundant if its parent apex rule already exists
-    if is_wildcard_rule and domain_norm in ctx.abp_minimal:
+    if ctx.abp_whitelist_match(domain_norm):
+        return False
+    # Parent coverage: only count non-whitelisted parents as covering subdomains
+    for parent in _cached_suffixes(domain_norm)[1:]:
+        if parent in ctx.abp_minimal and not ctx.abp_whitelist_match(parent):
+            return True
+    # wildcard redundant if its parent apex rule already exists (and is not whitelisted)
+    if (
+        is_wildcard_rule
+        and domain_norm in ctx.abp_minimal
+        and not ctx.abp_whitelist_match(domain_norm)
+    ):
         return True
     # Wildcard coverage: honours that '*.example.com' does not cover the apex domain
-    return ctx.wildcard_covered(domain_norm)
+    return ctx.wildcard_covered(domain_norm) and not ctx.abp_whitelist_match(domain_norm)
 
 
 def handle_hosts_line(
@@ -362,7 +410,7 @@ def handle_abp_line(
         stats["abp_whitelists_removed"] += 1
         return True
 
-    if ctx.is_whitelisted(dn_norm) or map_key in ctx.whitelist_domains:
+    if ctx.abp_whitelist_match(dn_norm) or map_key in ctx.whitelist_domains:
         stats["abp_blocks_removed_by_whitelist"] += 1
         return True
 
@@ -544,6 +592,8 @@ class MergeContext:
         covered_by_abp: Predicate checking whether a plain domain is redundant.
         wildcard_covered: Predicate checking wildcard coverage for ABP rules.
         is_whitelisted: Predicate for whitelist coverage (cross-format).
+        abp_whitelist_match: Predicate for explicit ABP whitelist matches
+            (used to avoid treating whitelisted parents as covering subdomains).
         whitelist_domains: Normalized whitelist domains collected upfront.
         plain_minimal: Minimal covering set of plain domains from inputs.
         abp_minimal: Minimal covering set of ABP blocking domains.
@@ -557,6 +607,7 @@ class MergeContext:
     covered_by_abp: Callable[[str], bool]
     wildcard_covered: Callable[[str], bool]
     is_whitelisted: Callable[[str], bool]
+    abp_whitelist_match: Callable[[str], bool]
     whitelist_domains: set[str]
     plain_minimal: set[str]
     abp_minimal: set[str]
@@ -663,14 +714,21 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
         raise FileNotFoundError(f"Input directory not found: {input_dir}")
 
     abp_sets, file_lines_cache = collect_abp_and_cache_lines(input_dir)
-    abp_minimal: set[str] = abp_sets["abp_minimal"]
+    raw_abp: set[str] = abp_sets["raw_abp"]
     abp_wildcards: set[str] = abp_sets["wildcard_roots"]
     whitelist_domains: set[str] = abp_sets.get("whitelist_domains", set())
     plain_candidates: set[str] = abp_sets.get("plain_candidates", set())
 
-    wildcard_covered = _make_wildcard_checker(abp_wildcards)
-    covered_by_abp = _make_abp_coverage_checker(abp_minimal, wildcard_covered)
     is_whitelisted = _make_whitelist_checker(whitelist_domains)
+    abp_whitelist_match = _make_abp_whitelist_matcher(whitelist_domains)
+
+    abp_candidates = {dn for dn in raw_abp if not abp_whitelist_match(dn)}
+    abp_minimal: set[str] = minimal_covering_set(abp_candidates)
+
+    wildcard_covered = _make_wildcard_checker(abp_wildcards)
+    covered_by_abp = _make_abp_coverage_checker(
+        abp_minimal, wildcard_covered, abp_whitelist_match
+    )
 
     stats = {
         "files": 0,
@@ -710,6 +768,7 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
         covered_by_abp=covered_by_abp,
         wildcard_covered=wildcard_covered,
         is_whitelisted=is_whitelisted,
+        abp_whitelist_match=abp_whitelist_match,
         whitelist_domains=whitelist_domains,
         plain_minimal=plain_minimal,
         abp_minimal=abp_minimal,
@@ -783,30 +842,38 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
 
 
 def _print_summary(stats: dict[str, int]) -> None:
-    print(
-        "merge_and_classify: "
-        f"files={stats.get('files', 0)} lines_in={stats.get('lines_in', 0)} "
-        f"lines_out={stats.get('lines_out', 0)} duplicates_removed={stats.get('duplicates_removed', 0)} "
-        f"hosts_removed_by_abp={stats.get('hosts_removed_by_abp', 0)} "
-        f"hosts_removed_by_whitelist={stats.get('hosts_removed_by_whitelist', 0)} "
-        f"plain_removed_by_abp={stats.get('plain_removed_by_abp', 0)} "
-        f"plain_removed_by_whitelist={stats.get('plain_removed_by_whitelist', 0)} "
-        f"abp_subdomains_removed={stats.get('abp_subdomains_removed', 0)} "
-        f"plain_subdomains_removed={stats.get('plain_subdomains_removed', 0)} "
-        f"invalid_removed={stats.get('invalid_removed', 0)} "
-        f"conflicting_hosts_replaced={stats.get('conflicting_hosts_replaced', 0)} "
-        f"conflicting_hosts_skipped={stats.get('conflicting_hosts_skipped', 0)} "
-        f"abp_whitelists_removed={stats.get('abp_whitelists_removed', 0)} "
-        f"abp_blocks_removed_by_whitelist={stats.get('abp_blocks_removed_by_whitelist', 0)} "
-        f"local_hosts_removed={stats.get('local_hosts_removed', 0)}"
+    logger.info(
+        "merge_and_classify: files=%s lines_in=%s lines_out=%s "
+        "duplicates_removed=%s hosts_removed_by_abp=%s "
+        "hosts_removed_by_whitelist=%s plain_removed_by_abp=%s "
+        "plain_removed_by_whitelist=%s abp_subdomains_removed=%s "
+        "plain_subdomains_removed=%s invalid_removed=%s "
+        "conflicting_hosts_replaced=%s conflicting_hosts_skipped=%s "
+        "abp_whitelists_removed=%s abp_blocks_removed_by_whitelist=%s "
+        "local_hosts_removed=%s",
+        stats.get("files", 0),
+        stats.get("lines_in", 0),
+        stats.get("lines_out", 0),
+        stats.get("duplicates_removed", 0),
+        stats.get("hosts_removed_by_abp", 0),
+        stats.get("hosts_removed_by_whitelist", 0),
+        stats.get("plain_removed_by_abp", 0),
+        stats.get("plain_removed_by_whitelist", 0),
+        stats.get("abp_subdomains_removed", 0),
+        stats.get("plain_subdomains_removed", 0),
+        stats.get("invalid_removed", 0),
+        stats.get("conflicting_hosts_replaced", 0),
+        stats.get("conflicting_hosts_skipped", 0),
+        stats.get("abp_whitelists_removed", 0),
+        stats.get("abp_blocks_removed_by_whitelist", 0),
+        stats.get("local_hosts_removed", 0),
     )
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print(
-            "Usage: python -m scripts.merge_and_classify <input_dir> <merged_out>",
-            file=sys.stderr,
+        logger.error(
+            "Usage: python -m scripts.merge_and_classify <input_dir> <merged_out>"
         )
         sys.exit(2)
     inp = sys.argv[1]
@@ -815,5 +882,5 @@ if __name__ == "__main__":
         stats = transform(inp, merged)
         _print_summary(stats)
     except Exception as exc:
-        print(f"ERROR in merge_and_classify: {exc}", file=sys.stderr)
+        logger.exception("ERROR in merge_and_classify: %s", exc)
         sys.exit(1)

@@ -196,6 +196,7 @@ def handle_hosts_line(
         return True
 
     ip_part = props["ip"]
+    ip_canon, ip_is_unspecified, ip_is_loopback = ctx.canonicalize_ip(ip_part)
     original_hostnames = props["hostnames"]
     filtered_pairs: list[tuple[str, str]] = []
     normalized_total = 0
@@ -221,6 +222,15 @@ def handle_hosts_line(
             continue
         filtered_pairs.append((raw, norm))
 
+    def _ip_rank(is_unspecified: bool, is_loopback: bool, canonical_ip: str | None) -> int | None:
+        if canonical_ip is None:
+            return None
+        if is_loopback:
+            return 2
+        if is_unspecified:
+            return 0
+        return 1
+
     if not filtered_pairs:
         if normalized_total == 0:
             stats["invalid_removed"] += 1
@@ -235,6 +245,7 @@ def handle_hosts_line(
         return True
 
     kept_pairs: list[tuple[str, str]] = []
+    current_rank = _ip_rank(ip_is_unspecified, ip_is_loopback, ip_canon)
 
     for raw, norm in filtered_pairs:
         prev_entry = state.domain_map.get(norm)
@@ -253,6 +264,34 @@ def handle_hosts_line(
             kept_pairs.append((raw, norm))
             continue
         if prev_type == "hosts":
+            prev_ip_canon, prev_is_unspecified, prev_is_loopback = ctx.canonicalize_ip(_prev_ip)
+            prev_rank = _ip_rank(prev_is_unspecified, prev_is_loopback, prev_ip_canon)
+            if current_rank is None or prev_rank is None:
+                stats["duplicates_removed"] += 1
+                continue
+            if current_rank > prev_rank:
+                prev_hostnames = state.host_line_to_hostnames.get(prev_text, [])
+                state.remove_host_entry(prev_text, ctx.normalize)
+                if stats.get("lines_out", 0) > 0:
+                    stats["lines_out"] -= 1
+                stats["conflicting_hosts_replaced"] += 1
+
+                existing_norms = {n for _, n in kept_pairs}
+                for prev_raw in prev_hostnames:
+                    prev_norm = ctx.normalize(prev_raw)
+                    if not prev_norm or prev_norm in existing_norms:
+                        continue
+                    kept_pairs.append((prev_raw, prev_norm))
+                    existing_norms.add(prev_norm)
+                if norm not in existing_norms:
+                    kept_pairs.append((raw, norm))
+                    existing_norms.add(norm)
+                continue
+
+            if current_rank < prev_rank:
+                stats["conflicting_hosts_skipped"] += 1
+                continue
+
             stats["duplicates_removed"] += 1
             continue
 
@@ -326,6 +365,53 @@ def handle_abp_line(
     if ctx.is_whitelisted(dn_norm) or map_key in ctx.whitelist_domains:
         stats["abp_blocks_removed_by_whitelist"] += 1
         return True
+
+    def _remove_conflicting_hosts_for_domain() -> None:
+        """Drop existing hosts entries for the same domain before keeping the ABP rule."""
+        prev_host_entry = state.domain_map.get(dn_norm)
+        if not prev_host_entry or prev_host_entry[0] != "hosts":
+            return
+
+        host_line = prev_host_entry[1]
+        host_ip = prev_host_entry[2]
+        raw_hostnames = state.host_line_to_hostnames.get(host_line, [])
+
+        # Remove the old hosts line and all associated bookkeeping.
+        state.remove_host_entry(host_line, ctx.normalize)
+        if stats.get("lines_out", 0) > 0:
+            stats["lines_out"] -= 1
+        stats["conflicting_hosts_replaced"] += 1
+
+        if not raw_hostnames or not host_ip:
+            return
+
+        kept_raw: list[str] = []
+        kept_norms: set[str] = set()
+        for raw in raw_hostnames:
+            norm = ctx.normalize(raw)
+            if not norm or norm == dn_norm or norm in kept_norms:
+                continue
+            kept_raw.append(raw)
+            kept_norms.add(norm)
+
+        if not kept_raw:
+            return
+
+        new_line = f"{host_ip} {' '.join(kept_raw)}"
+        if state.has_seen(new_line):
+            stats["duplicates_removed"] += 1
+            return
+
+        state.add_rule(new_line)
+        state.host_line_to_hostnames[new_line] = kept_raw
+        state.host_line_to_hostnames_norm[new_line] = kept_norms
+        state.host_line_to_ip[new_line] = host_ip
+        for norm in kept_norms:
+            state.domain_map[norm] = ("hosts", new_line, host_ip)
+        stats["lines_out"] += 1
+
+    if not is_wildcard_subdomain:
+        _remove_conflicting_hosts_for_domain()
 
     prev_entry = state.domain_map.get(map_key)
     if prev_entry and prev_entry[0] == "abp":

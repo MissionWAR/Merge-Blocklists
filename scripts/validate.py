@@ -275,7 +275,7 @@ def _validate_supported_modifiers(
 
     for opt in options:
         name = opt["name"]
-        if name not in SUPPORTED_MODIFIERS and name != "domain":
+        if name not in SUPPORTED_MODIFIERS:
             stats["removed_bad_modifier"] += 1
             return False, False
         if name in LIMITING_MODIFIERS:

@@ -65,10 +65,12 @@ jobs:
         with:
           path: |
             .cache
+            lists/_raw/.pipeline_cache  # Reuse cleaned/validated intermediates between runs
           # Weekly cache prefix so runs within the same week share a single cache artifact
           key: blocklists-cache-v1-${{ env.CACHE_SLOT }}
           restore-keys: |
             blocklists-cache-v1-${{ env.CACHE_SLOT }}-
+            blocklists-cache-v1-
 
       # ============================================
       # Fetch & Process
@@ -201,9 +203,10 @@ jobs:
         run: |
           echo "🧹 Cleaning up old cache entries (>7 days)..."
           find .cache -type f -mtime +7 -delete 2>/dev/null || true
+          find "${{ env.RAW_OUT }}/.pipeline_cache" -type f -mtime +7 -delete 2>/dev/null || true
           
-          # Clean up temporary raw files (keep caches)
-          rm -rf "${{ env.RAW_OUT }}" 2>/dev/null || true
+          # Clean up temporary raw files but preserve the pipeline cache for reuse
+          find "${{ env.RAW_OUT }}" -mindepth 1 -maxdepth 1 ! -name ".pipeline_cache" -exec rm -rf {} + 2>/dev/null || true
           
           echo "✅ Cleanup completed"
 

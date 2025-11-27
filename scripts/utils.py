@@ -30,11 +30,18 @@ Example Usage:
 from __future__ import annotations
 
 import ipaddress
+import logging
+import os
 import re
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Iterator
+from types import SimpleNamespace
+from typing import Callable, Iterator, Sequence
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+logger = logging.getLogger(__name__)
 
 
 # -------------------------
@@ -48,8 +55,53 @@ WILDCARD = "*"
 ELEMENT_HIDING_MARKERS = ("##", "#@#", "#%#")
 
 # Performance tuning constants
-DOMAIN_CACHE_SIZE = 32768  # LRU cache size for domain normalization (supports 5M+ domains)
+DOMAIN_CACHE_SIZE = 32768  # LRU cache size for domain normalization (~5M+ domains)
 IO_BUFFER_SIZE = 131072  # 128KB buffer for file I/O (optimized for modern SSDs)
+
+# Shared statistics key namespaces (avoid magic strings across modules)
+REMOVE_COMMENTS_STATS_KEYS = SimpleNamespace(
+    LINES_IN="lines_in",
+    LINES_OUT="lines_out",
+    TRIMMED="trimmed",
+    DROPPED_COMMENTS="dropped_comments",
+    DROPPED_EMPTY="dropped_empty",
+)
+
+VALIDATE_STATS_KEYS = SimpleNamespace(
+    LINES_IN="lines_in",
+    LINES_OUT="lines_out",
+    REMOVED_INVALID="removed_invalid",
+    REMOVED_ELEMENT_HIDING="removed_element_hiding",
+    REMOVED_BAD_MODIFIER="removed_bad_modifier",
+    REMOVED_INVALID_HOST="removed_invalid_host",
+    REMOVED_MALFORMED="removed_malformed",
+    KEPT_REGEX="kept_regex",
+    KEPT_HOSTS="kept_hosts",
+    KEPT_ADBLOCK_DOMAIN="kept_adblock_domain",
+    KEPT_WILDCARD_TLD="kept_wildcard_tld",
+    KEPT_OTHER_ADBLOCK="kept_other_adblock",
+    REMOVED_COMMENTS="removed_comments",
+    REMOVED_EMPTY="removed_empty",
+)
+
+REMOVE_COMMENTS_SUMMARY_ORDER = (
+    REMOVE_COMMENTS_STATS_KEYS.LINES_IN,
+    REMOVE_COMMENTS_STATS_KEYS.LINES_OUT,
+    REMOVE_COMMENTS_STATS_KEYS.TRIMMED,
+    REMOVE_COMMENTS_STATS_KEYS.DROPPED_COMMENTS,
+    REMOVE_COMMENTS_STATS_KEYS.DROPPED_EMPTY,
+)
+
+VALIDATE_SUMMARY_ORDER = (
+    VALIDATE_STATS_KEYS.LINES_IN,
+    VALIDATE_STATS_KEYS.LINES_OUT,
+    VALIDATE_STATS_KEYS.REMOVED_INVALID,
+    VALIDATE_STATS_KEYS.REMOVED_ELEMENT_HIDING,
+    VALIDATE_STATS_KEYS.REMOVED_BAD_MODIFIER,
+    VALIDATE_STATS_KEYS.REMOVED_INVALID_HOST,
+    VALIDATE_STATS_KEYS.REMOVED_COMMENTS,
+    VALIDATE_STATS_KEYS.REMOVED_EMPTY,
+)
 
 _DOMAIN_REGEX = re.compile(
     r"^(?=.{1,255}$)[0-9A-Za-z]"
@@ -67,7 +119,9 @@ _DOMAIN_PATTERN_RE = re.compile(
 _NON_ASCII_RE = re.compile(r"[^\x00-\x7F]")
 _ABP_HOSTNAME_RE = re.compile(r"^\|\|([^\^]+)\^$", flags=re.IGNORECASE)
 _COMMENT_SEPARATOR_RE = re.compile(r"^[-=*_\.]{3,}$")
-_ELEMENT_HIDING_PATTERN_RE = re.compile(r"##|#@#|#%#")  # Optimized pattern matching for element hiding markers
+_ELEMENT_HIDING_PATTERN_RE = re.compile(
+    r"##|#@#|#%#"
+)  # Optimized element-hiding marker pattern
 
 # -------------------------
 # Public regex pattern aliases (for shared use across scripts)
@@ -135,6 +189,64 @@ def list_text_rule_files(directory: str | Path) -> list[Path]:
     ]
 
 
+def summarize_stats(
+    stats_list: list[dict[str, int | str]], keys: Sequence[str]
+) -> dict[str, int]:
+    """Aggregate totals for the provided keys across a list of stats dicts."""
+    return {key: sum(int(s.get(key, 0)) for s in stats_list) for key in keys}
+
+
+def format_summary(
+    label: str, stats_list: list[dict[str, int | str]], keys: Sequence[str]
+) -> str:
+    """Return a space-joined summary string matching existing CLI output."""
+    totals = summarize_stats(stats_list, keys)
+    parts = [f"{label}: files={len(stats_list)}"]
+    parts.extend(f"{key}={totals.get(key, 0)}" for key in keys)
+    return " ".join(parts)
+
+
+def process_text_rule_files(
+    input_path: str | Path,
+    output_path: str | Path,
+    job_builder: Callable[[Path, Path], tuple],
+    worker: Callable[[tuple], dict[str, int | str]],
+    parallel: bool = True,
+) -> list[dict[str, int | str]]:
+    """
+    Apply a worker to text files under input_path, mirroring input/output layout.
+
+    job_builder should return the argument tuple expected by worker.
+    """
+    inp = Path(input_path)
+    outp = Path(output_path)
+    results: list[dict[str, int | str]] = []
+
+    if inp.is_dir():
+        outp.mkdir(parents=True, exist_ok=True)
+        pairs = [(entry, outp / entry.name) for entry in list_text_rule_files(inp)]
+        if not pairs:
+            return results
+        jobs = [job_builder(src, dest) for src, dest in pairs]
+        if parallel and len(jobs) > 1:
+            max_workers = min(os.cpu_count() or 1, len(jobs))
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                for res in executor.map(worker, jobs):
+                    results.append(res)
+        else:
+            for job in jobs:
+                results.append(worker(job))
+    elif inp.is_file():
+        dest = outp / inp.name if outp.is_dir() else outp
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        job = job_builder(inp, dest)
+        results.append(worker(job))
+    else:
+        raise FileNotFoundError(f"Input path not found: {input_path}")
+
+    return results
+
+
 # -------------------------
 # Cached conversions
 # -------------------------
@@ -142,7 +254,8 @@ def list_text_rule_files(directory: str | Path) -> list[Path]:
 
 @lru_cache(maxsize=DOMAIN_CACHE_SIZE)
 def to_punycode(domain: str) -> str:
-    """Convert domain (possibly Unicode) to IDNA/punycode; on failure return original."""
+    """Convert domain (possibly Unicode) to IDNA/punycode; on failure return
+    original."""
     if not isinstance(domain, str) or domain == "":
         return domain
     try:
@@ -153,7 +266,8 @@ def to_punycode(domain: str) -> str:
 
 @lru_cache(maxsize=DOMAIN_CACHE_SIZE)
 def _normalize_domain_token_cached(domain: str) -> str:
-    """Normalize domain: lowercase, strip wildcard/trailing dots, and punycode if needed."""
+    """Normalize domain: lowercase, strip wildcard/trailing dots, and punycode if
+    needed."""
     d = domain.strip().lower()
     if d.startswith("*."):
         d = d[2:]
@@ -344,7 +458,8 @@ def build_plain_domain_minimal_set(
     covered_by_abp: Callable[[str], bool],
 ) -> set[str]:
     """
-    Given cached lines from all input files, return the minimal covering set of plain domains.
+    Given cached lines from all input files, return the minimal covering set of
+    plain domains.
 
     Args:
         file_lines_cache: Mapping of filename -> list of lines (already stripped).
@@ -499,7 +614,8 @@ def load_adblock_rule_properties(rule_text: str) -> dict:
 
 
 def convert_non_ascii_to_punycode(line: str) -> str:
-    """Replace domain-like substrings with punycode equivalents (no-op for ASCII)."""
+    """Replace domain-like substrings with punycode equivalents (no-op for
+    ASCII)."""
     if not _NON_ASCII_RE.search(line):
         return line
 
@@ -558,12 +674,20 @@ __all__ = [
     "ELEMENT_HIDING_MARKERS",
     "DOMAIN_CACHE_SIZE",
     "IO_BUFFER_SIZE",
+    "REMOVE_COMMENTS_STATS_KEYS",
+    "VALIDATE_STATS_KEYS",
+    "REMOVE_COMMENTS_SUMMARY_ORDER",
+    "VALIDATE_SUMMARY_ORDER",
     # Regex patterns
     "DOMAIN_REGEX",
     "ETC_HOSTS_REGEX",
     "ABP_HOSTNAME_RE",
     "NON_ASCII_RE",
     "ELEMENT_HIDING_PATTERN_RE",
+    # Shared helpers
+    "summarize_stats",
+    "format_summary",
+    "process_text_rule_files",
 ]
 
 # Lint-safe alias for backward compatibility

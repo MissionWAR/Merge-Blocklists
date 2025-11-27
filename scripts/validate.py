@@ -40,10 +40,11 @@ Examples:
         ||example.com^$script  (network modifier not supported for DNS)
         example  (plain text without proper format)
 """
+
 from __future__ import annotations
 
 import ipaddress
-import multiprocessing as mp
+import logging
 import re
 import sys
 import tempfile
@@ -53,6 +54,11 @@ from scripts import utils
 
 # Import shared constants from utils
 IO_BUFFER_SIZE = utils.IO_BUFFER_SIZE
+logging.basicConfig(
+    level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s"
+)
+logger = logging.getLogger(__name__)
+VK = utils.VALIDATE_STATS_KEYS
 
 
 # -------------------------
@@ -149,7 +155,7 @@ def split_options_with_escape(opt_text: str) -> list[str]:
         if c == ",":
             bs = _count_preceding_backslashes(opt_text, i)
             if bs % 2 == 1:
-                # escaped comma -> keep comma (remove single escape backslash if present in buf)
+                # escaped comma -> keep comma (drop a single preceding escape)
                 if buf and buf[-1] == "\\":
                     buf.pop()
                 buf.append(",")
@@ -177,7 +183,8 @@ _parse_adblock_tokens = utils.parse_rule_tokens
 def load_adblock_rule_properties(rule_text: str) -> dict:
     """
     Return structured properties for adblock-style rules:
-      { ruleText, pattern, whitelist, options: [{name, value}, ...] | None, hostname | None }
+      { ruleText, pattern, whitelist,
+        options: [{name, value}, ...] | None, hostname | None }
     """
     tokens = _parse_adblock_tokens(rule_text)
     props: dict = {
@@ -240,7 +247,7 @@ def _has_only_allowed_characters(pattern: str) -> bool:
 
 
 def _has_invalid_wildcard_combo(pattern: str, separator_idx: int) -> bool:
-    """Return True if a '*' appears after '^' (invalid for DNS-style blocking rules)."""
+    """Return True if a '*' appears after '^' (invalid for DNS-style rules)."""
     wildcard_idx = pattern.find(WILDCARD)
     return (
         separator_idx != -1
@@ -276,7 +283,7 @@ def _validate_supported_modifiers(
     for opt in options:
         name = opt["name"]
         if name not in SUPPORTED_MODIFIERS:
-            stats["removed_bad_modifier"] += 1
+            stats[VK.REMOVED_BAD_MODIFIER] += 1
             return False, False
         if name in LIMITING_MODIFIERS:
             has_limit_modifier = True
@@ -297,9 +304,9 @@ def _handle_wildcard_domain(
     if "*" not in domain_token:
         return False, False
     if domain_token.startswith("*.") and domain_token.count("*") == 1:
-        stats["kept_wildcard_tld"] += 1
+        stats[VK.KEPT_WILDCARD_TLD] += 1
         return True, True
-    stats["removed_malformed"] += 1
+    stats[VK.REMOVED_MALFORMED] += 1
     return True, False
 
 
@@ -310,11 +317,13 @@ def valid_hostname(
     hostname: str, rule_text: str, allowed_ip: bool, _has_limit_modifier: bool
 ) -> bool:
     """
-    Validate a hostname token (IDN-aware). Accept TLDs and wildcard patterns where appropriate.
+    Validate a hostname token (IDN-aware). Accept TLDs and wildcard patterns
+    where appropriate.
 
-    Note: `_has_limit_modifier` is accepted for parity with the original HostlistCompiler
-    semantics and retained for future use; it is intentionally not used to alter
-    validation behavior in this implementation (underscore prefix signals intentional non-use).
+    Note: `_has_limit_modifier` is accepted for parity with the original
+    HostlistCompiler semantics and retained for future use; it is intentionally
+    not used to alter validation behavior in this implementation (underscore
+    prefix signals intentional non-use).
     """
     if not hostname:
         return False
@@ -326,8 +335,8 @@ def valid_hostname(
         host_for_ip_unbr = host_for_ip
 
     # IP detection with fast path optimization
-    # Quick check: IPs only contain digits, dots, colons, brackets, and hex chars (for IPv6)
-    # This avoids expensive ipaddress parsing for obvious non-IPs (e.g., "example.com")
+    # Quick check: IPs only contain digits, dots, colons, brackets, and hex chars
+    # (for IPv6). This avoids expensive ipaddress parsing for obvious non-IPs.
     is_ip = False
     if all(c in _IP_ALLOWED_CHARS for c in host_for_ip):
         # Potential IP - now do full validation
@@ -373,13 +382,13 @@ def valid_adblock_rule(rule_text: str, allowed_ip: bool, stats: dict[str, int]) 
     Updates stats counters for removed/kept categories.
     """
     if _is_element_hiding(rule_text):
-        stats["removed_element_hiding"] += 1
+        stats[VK.REMOVED_ELEMENT_HIDING] += 1
         return False
 
     try:
         props = load_adblock_rule_properties(rule_text)
     except Exception:
-        stats["removed_malformed"] += 1
+        stats[VK.REMOVED_MALFORMED] += 1
         return False
 
     modifiers_ok, has_limit_modifier = _validate_supported_modifiers(
@@ -391,27 +400,27 @@ def valid_adblock_rule(rule_text: str, allowed_ip: bool, stats: dict[str, int]) 
     pat = props.get("pattern") or ""
 
     if _pattern_is_regex_literal(pat):
-        stats["kept_regex"] += 1
+        stats[VK.KEPT_REGEX] += 1
         return True
 
     if not _has_only_allowed_characters(pat):
-        stats["removed_malformed"] += 1
+        stats[VK.REMOVED_MALFORMED] += 1
         return False
 
     sep_idx = pat.find(DOMAIN_SEPARATOR)
     if _has_invalid_wildcard_combo(pat, sep_idx):
-        stats["removed_malformed"] += 1
+        stats[VK.REMOVED_MALFORMED] += 1
         return False
 
     if not _is_domain_anchored_pattern(pat, sep_idx):
-        stats["kept_other_adblock"] += 1
+        stats[VK.KEPT_OTHER_ADBLOCK] += 1
         return True
 
     domain_to_check = substring_between(
         props.get("pattern") or "", DOMAIN_PREFIX, DOMAIN_SEPARATOR
     )
     if domain_to_check is None:
-        stats["removed_malformed"] += 1
+        stats[VK.REMOVED_MALFORMED] += 1
         return False
 
     wildcard_handled, wildcard_allowed = _handle_wildcard_domain(
@@ -421,14 +430,14 @@ def valid_adblock_rule(rule_text: str, allowed_ip: bool, stats: dict[str, int]) 
         return wildcard_allowed
 
     if not valid_hostname(domain_to_check, rule_text, allowed_ip, has_limit_modifier):
-        stats["removed_invalid_host"] += 1
+        stats[VK.REMOVED_INVALID_HOST] += 1
         return False
 
     if not _pattern_has_valid_terminator(pat, sep_idx):
-        stats["removed_malformed"] += 1
+        stats[VK.REMOVED_MALFORMED] += 1
         return False
 
-    stats["kept_adblock_domain"] += 1
+    stats[VK.KEPT_ADBLOCK_DOMAIN] += 1
     return True
 
 
@@ -458,31 +467,33 @@ def _is_pure_regex_line(s: str) -> bool:
 def valid(rule_text: str, allowed_ip: bool, stats: dict[str, int]) -> bool:
     """Top-level validity check. Returns True if the rule should be kept."""
 
-    # Remove blank lines (whitespace-only) unconditionally (you asked to drop blank lines).
+    # Remove blank lines (whitespace-only) unconditionally (you asked to drop
+    # blank lines).
     if is_blank_line(rule_text):
         # caller (Validator) will account for removed_empty stat
         return False
 
-    # Preserve explicit comments (starting with '!' or '#') here — Validator will still drop
-    # comments immediately preceding removed rules. This keeps parity with hostlist compiler,
-    # while removing blank lines only.
+    # Preserve explicit comments (starting with '!' or '#') here — Validator
+    # will still drop comments immediately preceding removed rules. This keeps
+    # parity with hostlist compiler, while removing blank lines only.
     if is_comment_line(rule_text):
         return True
 
     trimmed = rule_text.strip()
 
-    # Pure regex lines are accepted early (no compilation check) to mirror Hostlist Compiler behaviour.
+    # Pure regex lines are accepted early (no compilation check) to mirror
+    # Hostlist Compiler behaviour.
     if _is_pure_regex_line(trimmed):
-        stats["kept_regex"] += 1
+        stats[VK.KEPT_REGEX] += 1
         return True
 
     # /etc/hosts rule
     if utils.ETC_HOSTS_REGEX.match(trimmed):
         ok = valid_etc_hosts_rule(trimmed, allowed_ip)
         if ok:
-            stats["kept_hosts"] += 1
+            stats[VK.KEPT_HOSTS] += 1
         else:
-            stats["removed_invalid_host"] += 1
+            stats[VK.REMOVED_INVALID_HOST] += 1
         return ok
 
     # adblock-style
@@ -517,25 +528,29 @@ class Validator:
             is_valid_rule = valid(ln, self.allowed_ip, stats)
 
             if not is_valid_rule:
-                # If it's blank, count as removed_empty; if non-comment invalid rule, count removed_invalid.
+                # If it's blank, count as removed_empty; if non-comment invalid
+                # rule, count removed_invalid.
                 if is_blank:
-                    stats["removed_empty"] += 1
+                    stats[VK.REMOVED_EMPTY] += 1
                 elif not is_comment:
                     # non-comment invalid rule (malformed, element-hiding, etc.)
-                    stats["removed_invalid"] += 1
+                    stats[VK.REMOVED_INVALID] += 1
                 else:
-                    # explicit comment that valid() returned False for (rare), count as removed_comment
-                    stats["removed_comments"] += 1
+                    # explicit comment that valid() returned False for (rare),
+                    # count as removed_comment
+                    stats[VK.REMOVED_COMMENTS] += 1
                 prev_removed = True
                 continue
 
-            # If a previous rule was removed, drop any comment/blank line immediately preceding it.
+            # If a previous rule was removed, drop any comment/blank line
+            # immediately preceding it.
             if prev_removed and is_comment_or_blank:
                 if is_comment:
-                    stats["removed_comments"] += 1
+                    stats[VK.REMOVED_COMMENTS] += 1
                 else:
-                    stats["removed_empty"] += 1
-                # keep prev_removed True so we continue removing sequential comment/blank
+                    stats[VK.REMOVED_EMPTY] += 1
+                # keep prev_removed True so we continue removing sequential
+                # comment/blank
                 continue
 
             # otherwise keep the line
@@ -549,42 +564,47 @@ class Validator:
 # -------------------------
 # File processing & transforms
 # -------------------------
-def process_file(in_path: str, out_path: str, allow_ip: bool = True) -> dict[str, int | str]:
+def process_file(
+    in_path: str, out_path: str, allow_ip: bool = True
+) -> dict[str, int | str]:
     """
-    Read entire file (backwards-pass requires full list), validate, and write filtered output.
+    Read entire file (backwards-pass requires full list), validate, and write
+    filtered output.
 
-    Note: function signature is preserved for compatibility with existing workflow calls.
+    Note: function signature is preserved for compatibility with existing
+    workflow calls.
     """
     stats: dict[str, int | str] = {
         "in_path": in_path,
         "out_path": out_path,
-        "lines_in": 0,
-        "lines_out": 0,
-        "removed_invalid": 0,
-        "removed_element_hiding": 0,
-        "removed_bad_modifier": 0,
-        "removed_invalid_host": 0,
-        "removed_malformed": 0,
-        "kept_regex": 0,
-        "kept_hosts": 0,
-        "kept_adblock_domain": 0,
-        "kept_wildcard_tld": 0,
-        "kept_other_adblock": 0,
-        "removed_comments": 0,
-        "removed_empty": 0,
+        VK.LINES_IN: 0,
+        VK.LINES_OUT: 0,
+        VK.REMOVED_INVALID: 0,
+        VK.REMOVED_ELEMENT_HIDING: 0,
+        VK.REMOVED_BAD_MODIFIER: 0,
+        VK.REMOVED_INVALID_HOST: 0,
+        VK.REMOVED_MALFORMED: 0,
+        VK.KEPT_REGEX: 0,
+        VK.KEPT_HOSTS: 0,
+        VK.KEPT_ADBLOCK_DOMAIN: 0,
+        VK.KEPT_WILDCARD_TLD: 0,
+        VK.KEPT_OTHER_ADBLOCK: 0,
+        VK.REMOVED_COMMENTS: 0,
+        VK.REMOVED_EMPTY: 0,
     }
 
     in_path_p = Path(in_path)
+    lines: list[str] = []
     with in_path_p.open(
         "r", encoding="utf-8", errors="surrogateescape", buffering=IO_BUFFER_SIZE
     ) as fr:
-        lines = fr.readlines()
-        lines = [ln.rstrip("\n\r") for ln in lines]
-    stats["lines_in"] = len(lines)
+        for raw_line in fr:
+            lines.append(raw_line.rstrip("\r\n"))
+            stats[VK.LINES_IN] += 1
 
     validator = Validator(allow_ip)
     filtered = validator.validate(lines, stats)
-    stats["lines_out"] = len(filtered)
+    stats[VK.LINES_OUT] = len(filtered)
     out_path_p = Path(out_path)
     out_dir = out_path_p.parent
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -631,43 +651,21 @@ def _transform_internal(
         allow_ip: Whether to allow IP addresses in hostnames
         parallel: Use parallel processing for directories (default: True)
     """
-    results: list[dict[str, int | str]] = []
     inp = Path(input_path)
     outp = Path(output_path)
-    
     if inp.is_dir():
         outp.mkdir(parents=True, exist_ok=True)
-        
-        # Collect all files to process
-        files_to_process = [
-            (str(entry), str(outp / entry.name), allow_ip)
-            for entry in utils.list_text_rule_files(inp)
-        ]
-        
-        if not files_to_process:
-            return results
-        
-        # Use parallel processing if enabled and multiple files
-        if parallel and len(files_to_process) > 1:
-            # Use all available CPU cores (no artificial cap)
-            num_workers = min(mp.cpu_count(), len(files_to_process))
-            with mp.Pool(processes=num_workers) as pool:
-                results = pool.map(_process_file_worker, files_to_process)
-        else:
-            # Sequential processing (single file or parallel disabled)
-            for in_path, out_path, allow_ip_flag in files_to_process:
-                results.append(process_file(in_path, out_path, allow_ip_flag))
-                
-    elif inp.is_file():
-        if outp.is_dir():
-            out_file = outp / inp.name
-        else:
-            out_file = outp
-            out_file.parent.mkdir(parents=True, exist_ok=True)
-        results.append(process_file(str(inp), str(out_file), allow_ip))
-    else:
-        raise FileNotFoundError(f"Input path not found: {input_path}")
-    return results
+
+    def _job_builder(src: Path, dest: Path) -> tuple[str, str, bool]:
+        return str(src), str(dest), allow_ip
+
+    return utils.process_text_rule_files(
+        inp,
+        outp,
+        job_builder=_job_builder,
+        worker=_process_file_worker,
+        parallel=parallel,
+    )
 
 
 def transform(input_path: str, output_path: str) -> list[dict[str, int | str]]:
@@ -675,30 +673,23 @@ def transform(input_path: str, output_path: str) -> list[dict[str, int | str]]:
     return _transform_internal(input_path, output_path, allow_ip=True)
 
 
-def transform_disallow_ip(input_path: str, output_path: str) -> list[dict[str, int | str]]:
+def transform_disallow_ip(
+    input_path: str, output_path: str
+) -> list[dict[str, int | str]]:
     """Transform that disallows IP hostnames (parity/testing)."""
     return _transform_internal(input_path, output_path, allow_ip=False)
 
 
 def _print_summary(stats_list: list[dict[str, int | str]]) -> None:
-    total_in = sum(s["lines_in"] for s in stats_list)
-    total_out = sum(s["lines_out"] for s in stats_list)
-    total_removed = sum(s["removed_invalid"] for s in stats_list)
-    total_eh = sum(s["removed_element_hiding"] for s in stats_list)
-    total_badmod = sum(s["removed_bad_modifier"] for s in stats_list)
-    total_invalid_host = sum(s["removed_invalid_host"] for s in stats_list)
-    total_comments = sum(s["removed_comments"] for s in stats_list)
-    total_empty = sum(s["removed_empty"] for s in stats_list)
-    print(
-        f"validate: files={len(stats_list)} lines_in={total_in} lines_out={total_out} "
-        f"removed_invalid={total_removed} element_hiding={total_eh} bad_modifier={total_badmod} "
-        f"invalid_host={total_invalid_host} removed_comments={total_comments} removed_empty={total_empty}"
+    summary = utils.format_summary(
+        "validate", stats_list, utils.VALIDATE_SUMMARY_ORDER
     )
+    logger.info(summary)
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python -m scripts.validate INPUT OUTPUT", file=sys.stderr)
+        logger.error("Usage: python -m scripts.validate INPUT OUTPUT")
         sys.exit(2)
     inp = sys.argv[1]
     out = sys.argv[2]
@@ -706,5 +697,5 @@ if __name__ == "__main__":
         res = transform(inp, out)
         _print_summary(res)
     except Exception as exc:
-        print(f"ERROR in validate: {exc}", file=sys.stderr)
+        logger.exception("ERROR in validate: %s", exc)
         sys.exit(1)

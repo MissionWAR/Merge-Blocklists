@@ -5,7 +5,8 @@ pipeline.py
 Full DNS blocklist build pipeline for AdGuard Home with cache-aware cleanup/validation.
 
 Pipeline stages:
-  1. remove_comments     — Strip comments and blank lines (reuses cached outputs when possible).
+  1. remove_comments     — Strip comments and blank lines (reuses cached outputs
+                           when possible).
   2. validate            — Validate AdGuard-compatible syntax and hosts (cache-aware).
   3. merge_and_classify  — Merge, deduplicate, and normalize into a single output.
 
@@ -18,6 +19,7 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import tempfile
@@ -33,6 +35,11 @@ from scripts.cache_utils import IntermediateResultCache
 
 
 INTERMEDIATE_CACHE_DIR_NAME = ".pipeline_cache"
+logging.basicConfig(
+    level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s"
+)
+logger = logging.getLogger(__name__)
+StatsDict = dict[str, int | str]
 
 
 # ----------------------------------------
@@ -41,10 +48,11 @@ INTERMEDIATE_CACHE_DIR_NAME = ".pipeline_cache"
 def run_stage(module, inp: Path, out: Path, label: str) -> dict[str, Any]:
     """Run a single pipeline stage (inp → out).
     
-    Each stage module must have a transform() function that takes input and output paths.
-    If the module has a _print_summary() function, it will be called with the stats.
+    Each stage module must have a transform() function that takes input and
+    output paths. If the module has a _print_summary() function, it will be
+    called with the stats.
     """
-    print(f"[Pipeline] Starting stage: {label}")
+    logger.info("[Pipeline] Starting stage: %s", label)
     stats = module.transform(str(inp), str(out))
     if hasattr(module, "_print_summary"):
         module._print_summary(stats)
@@ -60,7 +68,9 @@ def _cache_dir_for_input(inp: Path) -> Path:
     return inp / INTERMEDIATE_CACHE_DIR_NAME
 
 
-def _process_clean_validate_job(args: tuple[str, str, str]) -> tuple[dict[str, int | str], dict[str, int | str]]:
+def _process_clean_validate_job(
+    args: tuple[str, str, str]
+) -> tuple[StatsDict, StatsDict]:
     """Worker to run remove_comments + validate for a single file."""
     src, cleaned_dest, validated_dest = args
     clean_result = remove_comments.process_file(src, cleaned_dest)
@@ -74,7 +84,7 @@ def _clean_and_validate_with_cache(
     cleaned_dir: Path,
     validated_dir: Path,
     cache: IntermediateResultCache,
-) -> tuple[list[dict[str, int | str]], list[dict[str, int | str]], int]:
+) -> tuple[list[StatsDict], list[StatsDict], int]:
     """
     Clean + validate inputs while persisting intermediates (cache-aware by design).
 
@@ -115,11 +125,15 @@ def _clean_and_validate_with_cache(
             validate_stats.append(validate_result)
             rel_key, raw_hash, cleaned_dest, validated_dest = job_meta[0]
             try:
-                cache.store_result(rel_key, raw_hash, cleaned_dest, validated_dest)
+                cache.store_result(
+                    rel_key, raw_hash, cleaned_dest, validated_dest
+                )
             except Exception as exc:
-                print(
-                    f"[Pipeline] Warning: failed to cache intermediates for {rel_key}: {exc}",
-                    file=sys.stderr,
+                logger.warning(
+                    "[Pipeline] Warning: failed to cache intermediates for %s:"
+                    " %s",
+                    rel_key,
+                    exc,
                 )
         else:
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -130,11 +144,15 @@ def _clean_and_validate_with_cache(
                     validate_stats.append(validate_result)
                     rel_key, raw_hash, cleaned_dest, validated_dest = meta
                     try:
-                        cache.store_result(rel_key, raw_hash, cleaned_dest, validated_dest)
+                        cache.store_result(
+                            rel_key, raw_hash, cleaned_dest, validated_dest
+                        )
                     except Exception as exc:
-                        print(
-                            f"[Pipeline] Warning: failed to cache intermediates for {rel_key}: {exc}",
-                            file=sys.stderr,
+                        logger.warning(
+                            "[Pipeline] Warning: failed to cache intermediates for %s:"
+                            " %s",
+                            rel_key,
+                            exc,
                         )
 
     return clean_stats, validate_stats, reused
@@ -158,21 +176,23 @@ def transform(input_dir: str, output_file: str) -> None:
         cleaned_dir = tmp / "cleaned"
         validated_dir = tmp / "validated"
 
-        print("[Pipeline] Starting stage: Cleaning input files")
+        logger.info("[Pipeline] Starting stage: Cleaning input files")
         clean_stats, validate_stats, reused = _clean_and_validate_with_cache(
             source_files, inp_path, cleaned_dir, validated_dir, cache
         )
         if hasattr(remove_comments, "_print_summary"):
             remove_comments._print_summary(clean_stats)
 
-        print("[Pipeline] Starting stage: Validating rules")
+        logger.info("[Pipeline] Starting stage: Validating rules")
         if hasattr(validate, "_print_summary"):
             validate._print_summary(validate_stats)
 
         total_files = len(source_files)
         if total_files:
-            print(
-                f"[Pipeline] Cached intermediates reused: {reused}/{total_files} files"
+            logger.info(
+                "[Pipeline] Cached intermediates reused: %s/%s files",
+                reused,
+                total_files,
             )
 
         merge_parent = out_path.parent
@@ -194,14 +214,14 @@ def transform(input_dir: str, output_file: str) -> None:
         )
 
         merge_target.replace(out_path)
-        print(f"[Pipeline] Successfully saved output to: {out_path}")
+        logger.info("[Pipeline] Successfully saved output to: %s", out_path)
 
 
 # CLI entrypoint
 # ----------------------------------------
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python -m scripts.pipeline <input_dir> <output_file>")
+        logger.error("Usage: python -m scripts.pipeline <input_dir> <output_file>")
         sys.exit(2)
 
     inp = sys.argv[1]
@@ -210,5 +230,5 @@ if __name__ == "__main__":
     try:
         transform(inp, out)
     except Exception as exc:
-        print(f"[FATAL] {exc}", file=sys.stderr)
+        logger.exception("[FATAL] %s", exc)
         sys.exit(1)

@@ -2,12 +2,11 @@
 """
 pipeline.py
 
-Full DNS blocklist build pipeline for AdGuard Home with cache-aware cleanup/validation.
+Full DNS blocklist build pipeline for AdGuard Home.
 
 Pipeline stages:
-  1. remove_comments     — Strip comments and blank lines (reuses cached outputs
-                           when possible).
-  2. validate            — Validate AdGuard-compatible syntax and hosts (cache-aware).
+  1. remove_comments     — Strip comments and blank lines.
+  2. validate            — Validate AdGuard-compatible syntax and hosts.
   3. merge_and_classify  — Merge, deduplicate, and normalize into a single output.
 
 Each stage writes to a temporary directory and passes its result to the next.
@@ -19,143 +18,31 @@ Usage:
 
 from __future__ import annotations
 
-import logging
 import os
 import sys
 import tempfile
-from concurrent.futures import ProcessPoolExecutor
+import time
 from pathlib import Path
 from typing import Any
 
 import scripts.merge_and_classify as merge_and_classify
 import scripts.remove_comments as remove_comments
 import scripts.validate as validate
-from scripts import utils
-from scripts.cache_utils import IntermediateResultCache
-
-
-INTERMEDIATE_CACHE_DIR_NAME = ".pipeline_cache"
-logging.basicConfig(
-    level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s"
-)
-logger = logging.getLogger(__name__)
-StatsDict = dict[str, int | str]
 
 
 # ----------------------------------------
 # Helpers
 # ----------------------------------------
 def run_stage(module, inp: Path, out: Path, label: str) -> dict[str, Any]:
-    """Run a single pipeline stage (inp → out).
-    
-    Each stage module must have a transform() function that takes input and
-    output paths. If the module has a _print_summary() function, it will be
-    called with the stats.
-    """
-    logger.info("[Pipeline] Starting stage: %s", label)
+    """Run a single pipeline stage (inp → out) with consistent console output."""
+    print(f"\n[Pipeline] === {label} ===")
+    start = time.perf_counter()
     stats = module.transform(str(inp), str(out))
     if hasattr(module, "_print_summary"):
         module._print_summary(stats)
+    elapsed = time.perf_counter() - start
+    print(f"[Pipeline] Finished {label} in {elapsed:.2f}s")
     return stats
-
-
-def _collect_source_files(inp: Path) -> list[Path]:
-    """Return alphabetized list of source .txt files for the pipeline."""
-    return utils.list_text_rule_files(inp)
-
-
-def _cache_dir_for_input(inp: Path) -> Path:
-    return inp / INTERMEDIATE_CACHE_DIR_NAME
-
-
-def _process_clean_validate_job(
-    args: tuple[str, str, str]
-) -> tuple[StatsDict, StatsDict]:
-    """Worker to run remove_comments + validate for a single file."""
-    src, cleaned_dest, validated_dest = args
-    clean_result = remove_comments.process_file(src, cleaned_dest)
-    validate_result = validate.process_file(cleaned_dest, validated_dest)
-    return clean_result, validate_result
-
-
-def _clean_and_validate_with_cache(
-    files: list[Path],
-    inp_root: Path,
-    cleaned_dir: Path,
-    validated_dir: Path,
-    cache: IntermediateResultCache,
-) -> tuple[list[StatsDict], list[StatsDict], int]:
-    """
-    Clean + validate inputs while persisting intermediates (cache-aware by design).
-
-    Returns per-stage stats along with a reuse counter indicating how many files
-    were restored directly from the intermediate cache (those files skip re-run).
-    """
-    clean_stats: list[dict[str, int | str]] = []
-    validate_stats: list[dict[str, int | str]] = []
-    reused = 0
-
-    cleaned_dir.mkdir(parents=True, exist_ok=True)
-    validated_dir.mkdir(parents=True, exist_ok=True)
-
-    jobs: list[tuple[str, str, str]] = []
-    job_meta: list[tuple[str, str, Path, Path]] = []
-
-    for src in files:
-        rel_path = src.relative_to(inp_root)
-        rel_key = rel_path.as_posix()
-        raw_hash = cache.raw_hash(src)
-        cleaned_dest = cleaned_dir / rel_path
-        validated_dest = validated_dir / rel_path
-
-        if cache.can_reuse(rel_key, raw_hash) and cache.restore(
-            rel_key, cleaned_dest, validated_dest
-        ):
-            reused += 1
-            continue
-
-        jobs.append((str(src), str(cleaned_dest), str(validated_dest)))
-        job_meta.append((rel_key, raw_hash, cleaned_dest, validated_dest))
-
-    if jobs:
-        max_workers = min(os.cpu_count() or 1, len(jobs))
-        if len(jobs) == 1:
-            clean_result, validate_result = _process_clean_validate_job(jobs[0])
-            clean_stats.append(clean_result)
-            validate_stats.append(validate_result)
-            rel_key, raw_hash, cleaned_dest, validated_dest = job_meta[0]
-            try:
-                cache.store_result(
-                    rel_key, raw_hash, cleaned_dest, validated_dest
-                )
-            except Exception as exc:
-                logger.warning(
-                    "[Pipeline] Warning: failed to cache intermediates for %s:"
-                    " %s",
-                    rel_key,
-                    exc,
-                )
-        else:
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                for (clean_result, validate_result), meta in zip(
-                    executor.map(_process_clean_validate_job, jobs), job_meta
-                ):
-                    clean_stats.append(clean_result)
-                    validate_stats.append(validate_result)
-                    rel_key, raw_hash, cleaned_dest, validated_dest = meta
-                    try:
-                        cache.store_result(
-                            rel_key, raw_hash, cleaned_dest, validated_dest
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "[Pipeline] Warning: failed to cache intermediates for %s:"
-                            " %s",
-                            rel_key,
-                            exc,
-                        )
-
-    return clean_stats, validate_stats, reused
 
 
 # ----------------------------------------
@@ -164,36 +51,19 @@ def _clean_and_validate_with_cache(
 def transform(input_dir: str, output_file: str) -> None:
     """Run the full blocklist processing pipeline."""
 
+    run_start = time.perf_counter()
     inp_path = Path(input_dir)
     out_path = Path(output_file)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    source_files = _collect_source_files(inp_path)
-    cache_dir = _cache_dir_for_input(inp_path)
-    cache = IntermediateResultCache(cache_dir)
+    print("[Pipeline] Starting pipeline run")
 
     with tempfile.TemporaryDirectory(prefix="pipeline_") as tmpdir:
         tmp = Path(tmpdir)
         cleaned_dir = tmp / "cleaned"
         validated_dir = tmp / "validated"
 
-        logger.info("[Pipeline] Starting stage: Cleaning input files")
-        clean_stats, validate_stats, reused = _clean_and_validate_with_cache(
-            source_files, inp_path, cleaned_dir, validated_dir, cache
-        )
-        if hasattr(remove_comments, "_print_summary"):
-            remove_comments._print_summary(clean_stats)
-
-        logger.info("[Pipeline] Starting stage: Validating rules")
-        if hasattr(validate, "_print_summary"):
-            validate._print_summary(validate_stats)
-
-        total_files = len(source_files)
-        if total_files:
-            logger.info(
-                "[Pipeline] Cached intermediates reused: %s/%s files",
-                reused,
-                total_files,
-            )
+        run_stage(remove_comments, inp_path, cleaned_dir, "Cleaning input files")
+        run_stage(validate, cleaned_dir, validated_dir, "Validating rules")
 
         merge_parent = out_path.parent
         fd, merge_name = tempfile.mkstemp(
@@ -214,14 +84,15 @@ def transform(input_dir: str, output_file: str) -> None:
         )
 
         merge_target.replace(out_path)
-        logger.info("[Pipeline] Successfully saved output to: %s", out_path)
+        total_elapsed = time.perf_counter() - run_start
+        print(f"[Pipeline] Output saved to: {out_path} (total {total_elapsed:.2f}s)")
 
 
 # CLI entrypoint
 # ----------------------------------------
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        logger.error("Usage: python -m scripts.pipeline <input_dir> <output_file>")
+        print("Usage: python -m scripts.pipeline <input_dir> <output_file>")
         sys.exit(2)
 
     inp = sys.argv[1]
@@ -230,5 +101,5 @@ if __name__ == "__main__":
     try:
         transform(inp, out)
     except Exception as exc:
-        logger.exception("[FATAL] %s", exc)
+        print(f"[FATAL] {exc}", file=sys.stderr)
         sys.exit(1)

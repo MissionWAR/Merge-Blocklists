@@ -96,15 +96,7 @@ def _make_whitelist_checker(whitelist: set[str]) -> Callable[[str], bool]:
             return False
         if domain in whitelist_lookup:
             return True
-        for suffix in _cached_suffixes(domain):
-            if suffix == domain:
-                continue
-            if suffix in whitelist_lookup:
-                return True
-            wildcard_key = f"*.{suffix}"
-            if wildcard_key in whitelist_lookup:
-                return True
-        return False
+        return _has_parent_cached(domain, whitelist_lookup)
 
     return _is_whitelisted
 
@@ -621,8 +613,7 @@ def collect_abp_and_cache_lines(
                         continue
 
                     if is_whitelist_rule:
-                        map_key = f"*.{dn_norm}" if abp_domain.startswith("*.") else dn_norm
-                        whitelist_domains.add(map_key)
+                        whitelist_domains.add(dn_norm)
                         continue
 
                     if abp_domain.startswith("*.") and "." in abp_domain[2:]:
@@ -727,6 +718,7 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
             if not line:
                 continue
 
+            is_whitelist_rule = line.startswith("@@")
             first_char = line[0]
             looks_like_hosts = (
                 (" " in line or "\t" in line)
@@ -743,6 +735,10 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
             abp_domain = substring_between(line, DOMAIN_PREFIX, DOMAIN_SEPARATOR)
             if abp_domain:
                 handle_abp_line(line, abp_domain, state, ctx, stats)
+                continue
+
+            if is_whitelist_rule:
+                stats["abp_whitelists_removed"] += 1
                 continue
 
             if _looks_like_plain_domain(line) and domain_regex.match(line):

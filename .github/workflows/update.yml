@@ -105,7 +105,7 @@ jobs:
 
           pipeline_start=$(date +%s)
           
-          # Run the full pipeline (uses .pipeline_cache internally when available)
+          # Run the full pipeline
           python -m scripts.pipeline "${{ env.RAW_OUT }}" "${{ env.MERGED_OUT }}"
 
           pipeline_end=$(date +%s)

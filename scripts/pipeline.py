@@ -18,6 +18,7 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import tempfile
@@ -33,15 +34,28 @@ import scripts.validate as validate
 # ----------------------------------------
 # Helpers
 # ----------------------------------------
-def run_stage(module, inp: Path, out: Path, label: str) -> dict[str, Any]:
+def _configure_logging() -> logging.Logger:
+    """Return configured pipeline logger with a clean, single-line format."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
+    return logging.getLogger("pipeline")
+
+
+def run_stage(
+    module,
+    inp: Path,
+    out: Path,
+    label: str,
+    log: logging.Logger,
+) -> dict[str, Any]:
     """Run a single pipeline stage (inp → out) with consistent console output."""
-    print(f"\n[Pipeline] === {label} ===")
+    log.info("")
+    log.info(f"[Pipeline] === {label} ===")
     start = time.perf_counter()
     stats = module.transform(str(inp), str(out))
     if hasattr(module, "_print_summary"):
         module._print_summary(stats)
     elapsed = time.perf_counter() - start
-    print(f"[Pipeline] Finished {label} in {elapsed:.2f}s")
+    log.info(f"[Pipeline] Finished {label} in {elapsed:.2f}s")
     return stats
 
 
@@ -51,19 +65,20 @@ def run_stage(module, inp: Path, out: Path, label: str) -> dict[str, Any]:
 def transform(input_dir: str, output_file: str) -> None:
     """Run the full blocklist processing pipeline."""
 
+    log = _configure_logging()
     run_start = time.perf_counter()
     inp_path = Path(input_dir)
     out_path = Path(output_file)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    print("[Pipeline] Starting pipeline run")
+    log.info("[Pipeline] Starting pipeline run")
 
     with tempfile.TemporaryDirectory(prefix="pipeline_") as tmpdir:
         tmp = Path(tmpdir)
         cleaned_dir = tmp / "cleaned"
         validated_dir = tmp / "validated"
 
-        run_stage(remove_comments, inp_path, cleaned_dir, "Cleaning input files")
-        run_stage(validate, cleaned_dir, validated_dir, "Validating rules")
+        run_stage(remove_comments, inp_path, cleaned_dir, "Cleaning input files", log)
+        run_stage(validate, cleaned_dir, validated_dir, "Validating rules", log)
 
         merge_parent = out_path.parent
         fd, merge_name = tempfile.mkstemp(
@@ -81,11 +96,12 @@ def transform(input_dir: str, output_file: str) -> None:
             validated_dir,
             merge_target,
             "Merging and deduplicating",
+            log,
         )
 
         merge_target.replace(out_path)
         total_elapsed = time.perf_counter() - run_start
-        print(f"[Pipeline] Output saved to: {out_path} (total {total_elapsed:.2f}s)")
+        log.info(f"[Pipeline] Output saved to: {out_path} (total {total_elapsed:.2f}s)")
 
 
 # CLI entrypoint

@@ -36,7 +36,9 @@ import scripts.validate as validate
 # ----------------------------------------
 def _configure_logging() -> logging.Logger:
     """Return configured pipeline logger with a clean, single-line format."""
-    logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
+    logging.basicConfig(
+        level=logging.INFO, format="%(message)s", force=True, stream=sys.stdout
+    )
     return logging.getLogger("pipeline")
 
 
@@ -49,13 +51,14 @@ def run_stage(
 ) -> dict[str, Any]:
     """Run a single pipeline stage (inp → out) with consistent console output."""
     log.info("")
-    log.info(f"[Pipeline] === {label} ===")
+    log.info(f"=== {label} ===")
     start = time.perf_counter()
     stats = module.transform(str(inp), str(out))
     if hasattr(module, "_print_summary"):
         module._print_summary(stats)
+        sys.stdout.flush()
     elapsed = time.perf_counter() - start
-    log.info(f"[Pipeline] Finished {label} in {elapsed:.2f}s")
+    log.info(f"Finished {label} in {elapsed:.2f}s")
     return stats
 
 
@@ -70,7 +73,7 @@ def transform(input_dir: str, output_file: str) -> None:
     inp_path = Path(input_dir)
     out_path = Path(output_file)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    log.info("[Pipeline] Starting pipeline run")
+    log.info("Starting pipeline run")
 
     with tempfile.TemporaryDirectory(prefix="pipeline_") as tmpdir:
         tmp = Path(tmpdir)
@@ -101,7 +104,7 @@ def transform(input_dir: str, output_file: str) -> None:
 
         merge_target.replace(out_path)
         total_elapsed = time.perf_counter() - run_start
-        log.info(f"[Pipeline] Output saved to: {out_path} (total {total_elapsed:.2f}s)")
+        log.info(f"Output saved to: {out_path} (total {total_elapsed:.2f}s)")
 
 
 # CLI entrypoint

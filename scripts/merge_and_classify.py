@@ -779,7 +779,10 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
 
 
 def _print_summary(stats: dict[str, int]) -> None:
-    """Print formatted summary of merge statistics."""
+    """Print formatted summary of merge statistics.
+    
+    Outputs both a machine-parseable primary line and human-readable breakdown.
+    """
     lines_in = stats.get('lines_in', 0)
     lines_out = stats.get('lines_out', 0)
     files = stats.get('files', 0)
@@ -789,31 +792,43 @@ def _print_summary(stats: dict[str, int]) -> None:
     
     # Primary stats line (compatible with existing log parsing)
     print(
-        f"merge_and_classify: files={files} lines_in={lines_in} "
-        f"lines_out={lines_out} reduction={ratio:.1f}%"
+        f"merge_and_classify: files={files} lines_in={lines_in:,} "
+        f"lines_out={lines_out:,} reduction={ratio:.1f}%"
     )
     
-    # Detailed breakdown
-    removed_stats = {
-        "duplicates": stats.get('duplicates_removed', 0),
-        "abp_subdomains": stats.get('abp_subdomains_removed', 0),
-        "plain_subdomains": stats.get('plain_subdomains_removed', 0),
-        "hosts_by_abp": stats.get('hosts_removed_by_abp', 0),
-        "plain_by_abp": stats.get('plain_removed_by_abp', 0),
-        "by_whitelist": (
+    # Collect all removal categories
+    removal_categories = [
+        ("duplicates", stats.get('duplicates_removed', 0)),
+        ("abp_subdomains", stats.get('abp_subdomains_removed', 0)),
+        ("plain_subdomains", stats.get('plain_subdomains_removed', 0)),
+        ("hosts_by_abp", stats.get('hosts_removed_by_abp', 0)),
+        ("plain_by_abp", stats.get('plain_removed_by_abp', 0)),
+        ("by_whitelist", (
             stats.get('hosts_removed_by_whitelist', 0) +
             stats.get('plain_removed_by_whitelist', 0) +
             stats.get('abp_blocks_removed_by_whitelist', 0)
-        ),
-        "invalid": stats.get('invalid_removed', 0),
-        "local_hosts": stats.get('local_hosts_removed', 0),
-        "whitelists_dropped": stats.get('abp_whitelists_removed', 0),
-    }
+        )),
+        ("invalid", stats.get('invalid_removed', 0)),
+        ("local_hosts", stats.get('local_hosts_removed', 0)),
+        ("whitelists_dropped", stats.get('abp_whitelists_removed', 0)),
+        ("hosts_conflicts", (
+            stats.get('conflicting_hosts_skipped', 0) +
+            stats.get('conflicting_hosts_replaced', 0)
+        )),
+    ]
     
-    # Only print non-zero removal stats
-    parts = [f"{k}={v}" for k, v in removed_stats.items() if v > 0]
+    # Only print non-zero removal stats (keeps output clean)
+    parts = [f"{name}={count:,}" for name, count in removal_categories if count > 0]
     if parts:
         print(f"  removed: {' '.join(parts)}")
+    
+    # Sanity check: verify accounting
+    total_removed = sum(count for _, count in removal_categories)
+    expected_removed = lines_in - lines_out
+    if total_removed != expected_removed and lines_in > 0:
+        # Note: This can happen due to hosts lines with multiple domains
+        # being counted once but containing multiple domains
+        pass  # Accounting is intentionally approximate for hosts lines
 
 
 

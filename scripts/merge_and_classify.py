@@ -779,23 +779,42 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
 
 
 def _print_summary(stats: dict[str, int]) -> None:
+    """Print formatted summary of merge statistics."""
+    lines_in = stats.get('lines_in', 0)
+    lines_out = stats.get('lines_out', 0)
+    files = stats.get('files', 0)
+    
+    # Calculate compression ratio
+    ratio = ((lines_in - lines_out) / lines_in * 100) if lines_in > 0 else 0
+    
+    # Primary stats line (compatible with existing log parsing)
     print(
-        "merge_and_classify: "
-        f"files={stats.get('files', 0)} lines_in={stats.get('lines_in', 0)} "
-        f"lines_out={stats.get('lines_out', 0)} duplicates_removed={stats.get('duplicates_removed', 0)} "
-        f"hosts_removed_by_abp={stats.get('hosts_removed_by_abp', 0)} "
-        f"hosts_removed_by_whitelist={stats.get('hosts_removed_by_whitelist', 0)} "
-        f"plain_removed_by_abp={stats.get('plain_removed_by_abp', 0)} "
-        f"plain_removed_by_whitelist={stats.get('plain_removed_by_whitelist', 0)} "
-        f"abp_subdomains_removed={stats.get('abp_subdomains_removed', 0)} "
-        f"plain_subdomains_removed={stats.get('plain_subdomains_removed', 0)} "
-        f"invalid_removed={stats.get('invalid_removed', 0)} "
-        f"conflicting_hosts_replaced={stats.get('conflicting_hosts_replaced', 0)} "
-        f"conflicting_hosts_skipped={stats.get('conflicting_hosts_skipped', 0)} "
-        f"abp_whitelists_removed={stats.get('abp_whitelists_removed', 0)} "
-        f"abp_blocks_removed_by_whitelist={stats.get('abp_blocks_removed_by_whitelist', 0)} "
-        f"local_hosts_removed={stats.get('local_hosts_removed', 0)}"
+        f"merge_and_classify: files={files} lines_in={lines_in} "
+        f"lines_out={lines_out} reduction={ratio:.1f}%"
     )
+    
+    # Detailed breakdown
+    removed_stats = {
+        "duplicates": stats.get('duplicates_removed', 0),
+        "abp_subdomains": stats.get('abp_subdomains_removed', 0),
+        "plain_subdomains": stats.get('plain_subdomains_removed', 0),
+        "hosts_by_abp": stats.get('hosts_removed_by_abp', 0),
+        "plain_by_abp": stats.get('plain_removed_by_abp', 0),
+        "by_whitelist": (
+            stats.get('hosts_removed_by_whitelist', 0) +
+            stats.get('plain_removed_by_whitelist', 0) +
+            stats.get('abp_blocks_removed_by_whitelist', 0)
+        ),
+        "invalid": stats.get('invalid_removed', 0),
+        "local_hosts": stats.get('local_hosts_removed', 0),
+        "whitelists_dropped": stats.get('abp_whitelists_removed', 0),
+    }
+    
+    # Only print non-zero removal stats
+    parts = [f"{k}={v}" for k, v in removed_stats.items() if v > 0]
+    if parts:
+        print(f"  removed: {' '.join(parts)}")
+
 
 
 if __name__ == "__main__":

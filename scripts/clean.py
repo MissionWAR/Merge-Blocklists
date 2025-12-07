@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-remove_comments.py
+clean.py
 
-Strip comments and blank lines from blocklists.
+Clean blocklist files: strip comments, remove blank lines, and trim whitespace.
 
 Usage:
-    python -m scripts.remove_comments INPUT OUTPUT
+    python -m scripts.clean INPUT OUTPUT
 """
 
 from __future__ import annotations
@@ -30,8 +30,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 RC_KEYS = utils.REMOVE_COMMENTS_STATS_KEYS
-
-
 
 
 def _skip_regex_literal(s: str, opening_slash_idx: int) -> int:
@@ -62,7 +60,6 @@ def _strip_trailing_hash_safe(s: str) -> str:
     # preserve element-hiding/scriptlet-containing lines as-is: validator handles them
     if utils.is_element_hiding_rule(s):
         return s.rstrip()
-
 
     scan_idx = 0
     length = len(s)
@@ -220,14 +217,14 @@ def transform(
 def _print_summary(stats_list: list[dict[str, int | str]]) -> None:
     """Print aggregate statistics for all processed files."""
     summary = utils.format_summary(
-        "remove_comments", stats_list, utils.REMOVE_COMMENTS_SUMMARY_ORDER
+        "clean", stats_list, utils.REMOVE_COMMENTS_SUMMARY_ORDER
     )
     logger.info(summary)
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        logger.error("Usage: python -m scripts.remove_comments INPUT OUTPUT")
+        logger.error("Usage: python -m scripts.clean INPUT OUTPUT")
         sys.exit(2)
 
     input_path_arg = sys.argv[1]
@@ -237,5 +234,5 @@ if __name__ == "__main__":
         stats = transform(input_path_arg, output_path_arg)
         _print_summary(stats)
     except Exception as exc:
-        logger.exception("ERROR in remove_comments: %s", exc)
+        logger.exception("ERROR in clean: %s", exc)
         sys.exit(1)

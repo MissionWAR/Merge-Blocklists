@@ -5,7 +5,7 @@ pipeline.py
 Full DNS blocklist build pipeline for AdGuard Home.
 
 Pipeline stages:
-  1. remove_comments     — Strip comments and blank lines.
+  1. clean               — Strip comments, blank lines, and trim whitespace.
   2. validate            — Validate AdGuard-compatible syntax and hosts.
   3. merge_and_classify  — Merge, deduplicate, and normalize into a single output.
 
@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import scripts.merge_and_classify as merge_and_classify
-import scripts.remove_comments as remove_comments
+import scripts.clean as clean
 import scripts.validate as validate
 
 
@@ -80,7 +80,7 @@ def transform(input_dir: str, output_file: str) -> None:
         cleaned_dir = tmp / "cleaned"
         validated_dir = tmp / "validated"
 
-        run_stage(remove_comments, inp_path, cleaned_dir, "Cleaning input files", log)
+        run_stage(clean, inp_path, cleaned_dir, "Cleaning input files", log)
         run_stage(validate, cleaned_dir, validated_dir, "Validating rules", log)
 
         merge_parent = out_path.parent

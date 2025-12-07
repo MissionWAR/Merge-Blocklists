@@ -53,7 +53,7 @@ LOCAL_ONLY_HOSTNAMES = {
 }
 
 
-@lru_cache(maxsize=262144)
+@lru_cache(maxsize=524288)
 def _cached_suffixes(domain: str) -> tuple[str, ...]:
     """Return cached tuple of suffixes for repeated lookups."""
     return tuple(walk_suffixes(domain))
@@ -66,7 +66,7 @@ def _make_wildcard_checker(wildcard_roots: set[str]) -> Callable[[str], bool]:
 
     roots = frozenset(wildcard_roots)
 
-    @lru_cache(maxsize=131072)
+    @lru_cache(maxsize=262144)
     def _covered(domain: str) -> bool:
         if not domain or "." not in domain:
             return False
@@ -79,20 +79,45 @@ def _make_wildcard_checker(wildcard_roots: set[str]) -> Callable[[str], bool]:
     return _covered
 
 
-def _make_whitelist_checker(whitelist: set[str]) -> Callable[[str], bool]:
-    """Return cached predicate that checks whitelist coverage."""
-    if not whitelist:
+def _make_whitelist_checker(
+    whitelist: set[str], whitelist_wildcards: set[str] | None = None
+) -> Callable[[str], bool]:
+    """
+    Return cached predicate that checks whitelist coverage.
+
+    Args:
+        whitelist: Regular whitelist domains (@@||domain^) — covers domain + all subdomains
+        whitelist_wildcards: Wildcard whitelist domains (@@||*.domain^) — covers only subdomains, NOT apex
+
+    The distinction is important:
+        - @@||example.com^ → whitelists example.com AND sub.example.com
+        - @@||*.example.com^ → whitelists sub.example.com but NOT example.com
+    """
+    has_regular = bool(whitelist)
+    has_wildcards = bool(whitelist_wildcards)
+
+    if not has_regular and not has_wildcards:
         return lambda _domain: False
 
-    whitelist_lookup = frozenset(whitelist)
+    whitelist_lookup = frozenset(whitelist) if whitelist else frozenset()
+    wildcard_lookup = frozenset(whitelist_wildcards) if whitelist_wildcards else frozenset()
 
-    @lru_cache(maxsize=131072)
+    @lru_cache(maxsize=262144)
     def _is_whitelisted(domain: str) -> bool:
         if not domain:
             return False
-        if domain in whitelist_lookup:
-            return True
-        return _has_parent_cached(domain, whitelist_lookup)
+        # Check regular whitelists (exact match or parent match)
+        if whitelist_lookup:
+            if domain in whitelist_lookup:
+                return True
+            if _has_parent_cached(domain, whitelist_lookup):
+                return True
+        # Check wildcard whitelists (parent match only, NOT exact match)
+        # @@||*.example.com^ should whitelist sub.example.com but NOT example.com
+        if wildcard_lookup:
+            if _has_parent_cached(domain, wildcard_lookup):
+                return True
+        return False
 
     return _is_whitelisted
 
@@ -103,7 +128,7 @@ def _make_abp_coverage_checker(
     """Return cached predicate that checks ABP coverage (roots + wildcards)."""
     abp_lookup = frozenset(abp_minimal)
 
-    @lru_cache(maxsize=131072)
+    @lru_cache(maxsize=262144)
     def _covered(domain: str) -> bool:
         if not domain:
             return False
@@ -144,6 +169,12 @@ def _is_bare_abp_rule(
 
 def _has_important_modifier(rule_text: str) -> bool:
     """Return True if the ABP rule has the $important modifier."""
+    # Optimize: avoid .lower() on entire string; check common patterns first
+    if "$important" in rule_text:
+        return True
+    if "$IMPORTANT" in rule_text:
+        return True
+    # Fallback for mixed case (rare)
     return "$important" in rule_text.lower()
 
 
@@ -578,10 +609,13 @@ class MergeContext:
 # ----------------------------------------
 # IP helpers
 # ----------------------------------------
+@lru_cache(maxsize=1024)
 def _canonicalize_ip(ip_raw: str) -> tuple[str | None, bool, bool]:
     """
     Return (canonical_ip, is_unspecified, is_loopback).
     Handles zone IDs in IPv6 addresses.
+    
+    Cached because the same IPs (0.0.0.0, 127.0.0.1, ::1) appear thousands of times.
     """
     canonical = utils.canonicalize_ip(ip_raw)
     if canonical is None:
@@ -617,6 +651,7 @@ def collect_abp_sets(
     raw_abp: set[str] = set()
     wildcard_roots: set[str] = set()
     whitelist_domains: set[str] = set()
+    whitelist_wildcards: set[str] = set()  # @@||*.domain^ rules (subdomains only)
     plain_candidates: set[str] = set()
 
     domain_regex = utils.DOMAIN_REGEX
@@ -644,7 +679,11 @@ def collect_abp_sets(
                         continue
 
                     if is_whitelist_rule:
-                        whitelist_domains.add(dn_norm)
+                        # Distinguish @@||*.domain^ (wildcard) from @@||domain^ (regular)
+                        if abp_domain.startswith("*.") and "." in abp_domain[2:]:
+                            whitelist_wildcards.add(dn_norm)
+                        else:
+                            whitelist_domains.add(dn_norm)
                         continue
 
                     if abp_domain.startswith("*.") and "." in abp_domain[2:]:
@@ -669,6 +708,7 @@ def collect_abp_sets(
         "abp_minimal": minimal_covering_set(raw_abp),
         "wildcard_roots": wildcard_roots,
         "whitelist_domains": whitelist_domains,
+        "whitelist_wildcards": whitelist_wildcards,
         "plain_candidates": plain_candidates,
     }, file_paths
 
@@ -689,9 +729,11 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
     whitelist_domains: set[str] = abp_sets.get("whitelist_domains", set())
     plain_candidates: set[str] = abp_sets.get("plain_candidates", set())
 
+    whitelist_wildcards: set[str] = abp_sets.get("whitelist_wildcards", set())
+
     wildcard_covered = _make_wildcard_checker(abp_wildcards)
     covered_by_abp = _make_abp_coverage_checker(abp_minimal, wildcard_covered)
-    is_whitelisted = _make_whitelist_checker(whitelist_domains)
+    is_whitelisted = _make_whitelist_checker(whitelist_domains, whitelist_wildcards)
 
     stats = {
         "files": 0,

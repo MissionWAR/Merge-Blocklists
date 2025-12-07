@@ -62,7 +62,6 @@ IO_BUFFER_SIZE = utils.IO_BUFFER_SIZE
 DOMAIN_PREFIX = utils.DOMAIN_PREFIX
 DOMAIN_SEPARATOR = utils.DOMAIN_SEPARATOR
 WILDCARD = utils.WILDCARD
-ELEMENT_HIDING_MARKERS = utils.ELEMENT_HIDING_MARKERS
 
 # RFC 1035 DNS hostname limits
 MAX_HOSTNAME_LENGTH = 255  # Maximum total hostname length
@@ -123,90 +122,13 @@ _find_unescaped_char = utils.find_unescaped_char
 _find_last_unescaped_dollar = utils.find_last_unescaped_dollar
 
 
-def _count_preceding_backslashes(s: str, idx: int) -> int:
-    """Count consecutive backslashes immediately before position idx in s."""
-    j = idx - 1
-    count = 0
-    while j >= 0 and s[j] == "\\":
-        count += 1
-        j -= 1
-    return count
-
-
-def split_options_with_escape(opt_text: str) -> list[str]:
-    """
-    Split options by unescaped commas (honor backslash-escaped commas).
-    Trim tokens and drop empty ones.
-    """
-    if not opt_text:
-        return []
-    parts: list[str] = []
-    buf: list[str] = []
-    i = 0
-    n = len(opt_text)
-    while i < n:
-        c = opt_text[i]
-        if c == ",":
-            bs = _count_preceding_backslashes(opt_text, i)
-            if bs % 2 == 1:
-                # escaped comma -> keep comma (remove single escape backslash if present in buf)
-                if buf and buf[-1] == "\\":
-                    buf.pop()
-                buf.append(",")
-            else:
-                token = "".join(buf).strip()
-                if token:
-                    parts.append(token)
-                buf = []
-        else:
-            buf.append(c)
-        i += 1
-    token = "".join(buf).strip()
-    if token:
-        parts.append(token)
-    return parts
-
 
 # -------------------------
 # Adblock-style parsing (use utils implementation)
 # -------------------------
-# Use utils.parse_rule_tokens as the base implementation
-_parse_adblock_tokens = utils.parse_rule_tokens
 
-
-def load_adblock_rule_properties(rule_text: str) -> dict:
-    """
-    Return structured properties for adblock-style rules:
-      { ruleText, pattern, whitelist, options: [{name, value}, ...] | None, hostname | None }
-    """
-    tokens = _parse_adblock_tokens(rule_text)
-    props: dict = {
-        "ruleText": rule_text,
-        "pattern": tokens["pattern"],
-        "whitelist": tokens["whitelist"],
-        "options": None,
-        "hostname": None,
-    }
-
-    if tokens.get("options"):
-        parts = split_options_with_escape(tokens["options"])
-        opts = []
-        for p in parts:
-            if "=" in p:
-                name, value = p.split("=", 1)
-                name = name.strip().lower()
-                value = value.strip() if value is not None else None
-            else:
-                name = p.strip().lower()
-                value = None
-            if name:
-                opts.append({"name": name, "value": value})
-        if opts:
-            props["options"] = opts
-
-    m = utils.ABP_HOSTNAME_RE.match(props.get("pattern") or "")
-    props["hostname"] = m.group(1).lower() if m else None
-    return props
+# Use utils.load_adblock_rule_properties for consistency
+load_adblock_rule_properties = utils.load_adblock_rule_properties
 
 
 # -------------------------
@@ -218,9 +140,7 @@ is_comment_line = utils.is_comment_line
 is_blank_line = utils.is_blank_line
 
 
-def _is_element_hiding(rule_text: str) -> bool:
-    """Detect element-hiding/scriptlet markers anywhere in the rule."""
-    return any(marker in rule_text for marker in ELEMENT_HIDING_MARKERS)
+
 
 
 def _pattern_is_regex_literal(pattern: str) -> bool:
@@ -372,7 +292,7 @@ def valid_adblock_rule(rule_text: str, allowed_ip: bool, stats: dict[str, int]) 
     Validate adblock-style rules for DNS-level filtering.
     Updates stats counters for removed/kept categories.
     """
-    if _is_element_hiding(rule_text):
+    if utils.is_element_hiding_rule(rule_text):
         stats["removed_element_hiding"] += 1
         return False
 

@@ -266,23 +266,55 @@ def to_punycode(domain: str) -> str:
 
 @lru_cache(maxsize=DOMAIN_CACHE_SIZE)
 def _normalize_domain_token_cached(domain: str) -> str:
-    """Normalize domain: lowercase, strip wildcard/trailing dots, and punycode if
-    needed."""
+    """Normalize domain: lowercase, strip wildcard/trailing dots, and punycode if needed.
+    
+    Edge cases handled:
+    - Leading/trailing whitespace
+    - Wildcard prefix (*.)
+    - Trailing dots (FQDN notation)
+    - Multiple consecutive dots (collapsed)
+    - Non-ASCII characters (converted to punycode)
+    - Empty or whitespace-only input
+    """
     d = domain.strip().lower()
+    
+    # Strip wildcard prefix
     if d.startswith("*."):
         d = d[2:]
+    
+    # Strip trailing dots (FQDN notation)
     d = d.rstrip(".")
-    # Fast path: check if ASCII before regex (common case optimization)
+    
+    # Handle multiple consecutive dots (e.g., "a..b.c" -> "a.b.c")
+    while ".." in d:
+        d = d.replace("..", ".")
+    
+    # Strip leading dots that might remain
+    d = d.lstrip(".")
+    
+    # Return empty for invalid results
+    if not d:
+        return ""
+    
+    # Fast path: skip punycode for ASCII-only domains (common case)
     if not d.isascii():
         try:
             d = d.encode("idna").decode("ascii")
         except Exception:
-            pass
+            pass  # Keep original on encoding failure
+    
     return d
 
 
 def normalize_domain_token(domain: str | None) -> str:
-    """Normalize domain token for deduplication and comparison (cached internally)."""
+    """Normalize domain token for deduplication and comparison (cached internally).
+    
+    Args:
+        domain: Raw domain string (may include wildcards, trailing dots, unicode)
+        
+    Returns:
+        Normalized lowercase ASCII domain, or empty string if invalid
+    """
     if not domain or not domain.strip():
         return ""
     return _normalize_domain_token_cached(domain)

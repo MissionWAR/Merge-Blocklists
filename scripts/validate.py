@@ -140,9 +140,6 @@ is_comment_line = utils.is_comment_line
 is_blank_line = utils.is_blank_line
 
 
-
-
-
 def _pattern_is_regex_literal(pattern: str) -> bool:
     """
     Return True if the pattern is a raw /regex/ literal (without replace= modifiers).

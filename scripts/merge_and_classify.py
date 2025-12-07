@@ -390,6 +390,10 @@ def handle_abp_line(
         stats["abp_blocks_removed_by_whitelist"] += 1
         return True
 
+    if is_wildcard_subdomain and dn_norm in ctx.whitelist_wildcards:
+        stats["abp_blocks_removed_by_whitelist"] += 1
+        return True
+
     def _remove_conflicting_hosts_for_domain() -> None:
         """Drop existing hosts entries for the same domain before keeping the ABP rule."""
         prev_host_entry = state.domain_map.get(dn_norm)
@@ -587,6 +591,7 @@ class MergeContext:
         wildcard_covered: Predicate checking wildcard coverage for ABP rules.
         is_whitelisted: Predicate for whitelist coverage (cross-format).
         whitelist_domains: Normalized whitelist domains collected upfront.
+        whitelist_wildcards: Normalized wildcard whitelist domains collected upfront.
         plain_minimal: Minimal covering set of plain domains from inputs.
         abp_minimal: Minimal covering set of ABP blocking domains.
         abp_wildcards: Bare domains extracted from wildcard ABP rules (||*.d^).
@@ -600,6 +605,7 @@ class MergeContext:
     wildcard_covered: Callable[[str], bool]
     is_whitelisted: Callable[[str], bool]
     whitelist_domains: set[str]
+    whitelist_wildcards: set[str]
     plain_minimal: set[str]
     abp_minimal: set[str]
     abp_wildcards: set[str]
@@ -774,6 +780,7 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
         wildcard_covered=wildcard_covered,
         is_whitelisted=is_whitelisted,
         whitelist_domains=whitelist_domains,
+        whitelist_wildcards=whitelist_wildcards,
         plain_minimal=plain_minimal,
         abp_minimal=abp_minimal,
         abp_wildcards=abp_wildcards,

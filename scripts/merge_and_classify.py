@@ -28,12 +28,8 @@ DOMAIN_SEPARATOR = utils.DOMAIN_SEPARATOR
 IO_BUFFER_SIZE = utils.IO_BUFFER_SIZE
 substring_between = utils.substring_between
 normalize_domain_token = utils.normalize_domain_token
-walk_suffixes = utils.walk_suffixes
-has_parent = utils.has_parent_domain
 minimal_covering_set = utils.minimal_covering_set
-
-# compatibility shim for legacy tests
-_walk_suffixes = utils.walk_suffixes
+walk_suffixes = utils.walk_suffixes  # Used internally by _cached_suffixes
 
 
 LOCAL_ONLY_HOSTNAMES = {
@@ -144,6 +140,11 @@ def _is_bare_abp_rule(
     if re_abp_bare.match(rule_text):
         return True
     return is_wildcard_subdomain and "$" not in rule_text
+
+
+def _has_important_modifier(rule_text: str) -> bool:
+    """Return True if the ABP rule has the $important modifier."""
+    return "$important" in rule_text.lower()
 
 
 def _abp_rule_is_redundant(
@@ -412,7 +413,25 @@ def handle_abp_line(
         prev_is_bare = _is_bare_abp_rule(
             prev_text, prev_is_wildcard, ctx.re_abp_bare
         )
+        prev_has_important = _has_important_modifier(prev_text)
+        new_has_important = _has_important_modifier(line)
+
+        # Both bare → skip new (duplicate)
         if is_bare_rule and prev_is_bare:
+            stats["duplicates_removed"] += 1
+            return True
+
+        # New has $important, old is bare → replace old with new
+        if new_has_important and prev_is_bare:
+            state.remove_rule(prev_text)
+            state.domain_map.pop(map_key, None)
+            if stats.get("lines_out", 0) > 0:
+                stats["lines_out"] -= 1
+            stats["duplicates_removed"] += 1
+            # Fall through to add the new $important rule below
+
+        # New is bare, old has $important → skip new (old is stronger)
+        elif prev_has_important and is_bare_rule:
             stats["duplicates_removed"] += 1
             return True
 
@@ -576,28 +595,40 @@ def _canonicalize_ip(ip_raw: str) -> tuple[str | None, bool, bool]:
 
 
 # ----------------------------------------
-# ABP first-pass collection (optimized single-pass with caching)
+# ABP first-pass collection (memory-optimized: no line caching)
 # ----------------------------------------
-def collect_abp_and_cache_lines(
+def collect_abp_sets(
     input_dir: str,
-) -> tuple[dict[str, set[str]], dict[str, list[str]]]:
-    """Process input files once to collect ABP/whitelist data and cache stripped lines."""
+) -> tuple[dict[str, set[str]], list[Path]]:
+    """
+    First pass: collect ABP/whitelist/wildcard/plain domain sets.
+    
+    Memory optimization: Does NOT cache all lines in memory. Returns file paths
+    for the second pass to re-read (fast due to OS file cache).
+    
+    Returns:
+        (sets_dict, file_paths) where sets_dict contains:
+        - raw_abp: All ABP blocking domains (non-wildcard)
+        - abp_minimal: Minimal covering set of ABP domains
+        - wildcard_roots: Domains from wildcard rules (||*.domain^)
+        - whitelist_domains: Domains from whitelist rules (@@||domain^)
+        - plain_candidates: Plain domain candidates
+    """
     raw_abp: set[str] = set()
     wildcard_roots: set[str] = set()
     whitelist_domains: set[str] = set()
     plain_candidates: set[str] = set()
-    file_lines_cache: dict[str, list[str]] = {}
 
     domain_regex = utils.DOMAIN_REGEX
     is_hosts_rule = utils.is_etc_hosts_rule
     normalize = normalize_domain_token
 
-    for file_path in utils.list_text_rule_files(input_dir):
-        lines: list[str] = []
+    file_paths = utils.list_text_rule_files(input_dir)
+    
+    for file_path in file_paths:
         with file_path.open(encoding="utf-8-sig", errors="replace") as f:
             for line in f:
                 line = line.strip()
-                lines.append(line)
 
                 if not line:
                     continue
@@ -633,15 +664,13 @@ def collect_abp_and_cache_lines(
                     if dn_norm:
                         plain_candidates.add(dn_norm)
 
-        file_lines_cache[file_path.name] = lines
-
     return {
         "raw_abp": raw_abp,
         "abp_minimal": minimal_covering_set(raw_abp),
         "wildcard_roots": wildcard_roots,
         "whitelist_domains": whitelist_domains,
         "plain_candidates": plain_candidates,
-    }, file_lines_cache
+    }, file_paths
 
 
 # ----------------------------------------
@@ -653,7 +682,8 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
     if not in_path.is_dir():
         raise FileNotFoundError(f"Input directory not found: {input_dir}")
 
-    abp_sets, file_lines_cache = collect_abp_and_cache_lines(input_dir)
+    # First pass: collect ABP/whitelist/wildcard sets (memory-efficient, no line caching)
+    abp_sets, file_paths = collect_abp_sets(input_dir)
     abp_minimal: set[str] = abp_sets["abp_minimal"]
     abp_wildcards: set[str] = abp_sets["wildcard_roots"]
     whitelist_domains: set[str] = abp_sets.get("whitelist_domains", set())
@@ -709,43 +739,44 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
     )
     state = MergeState()
 
-    for filename in sorted(file_lines_cache.keys(), key=lambda n: n.lower()):
-        lines = file_lines_cache[filename]
+    # Second pass: re-read files and process lines (OS file cache makes this fast)
+    for file_path in sorted(file_paths, key=lambda p: p.name.lower()):
         stats["files"] += 1
+        with file_path.open(encoding="utf-8-sig", errors="replace") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                stats["lines_in"] += 1
+                if not line:
+                    continue
 
-        for line in lines:
-            stats["lines_in"] += 1
-            if not line:
-                continue
-
-            is_whitelist_rule = line.startswith("@@")
-            first_char = line[0]
-            looks_like_hosts = (
-                (" " in line or "\t" in line)
-                and (
-                    first_char.isdigit()
-                    or first_char in ("[", ":")
-                    or first_char.lower() in "abcdef"
+                is_whitelist_rule = line.startswith("@@")
+                first_char = line[0]
+                looks_like_hosts = (
+                    (" " in line or "\t" in line)
+                    and (
+                        first_char.isdigit()
+                        or first_char in ("[", ":")
+                        or first_char.lower() in "abcdef"
+                    )
                 )
-            )
-            if looks_like_hosts and is_hosts_re(line):
-                handle_hosts_line(line, state, ctx, stats)
-                continue
+                if looks_like_hosts and is_hosts_re(line):
+                    handle_hosts_line(line, state, ctx, stats)
+                    continue
 
-            abp_domain = substring_between(line, DOMAIN_PREFIX, DOMAIN_SEPARATOR)
-            if abp_domain:
-                handle_abp_line(line, abp_domain, state, ctx, stats)
-                continue
+                abp_domain = substring_between(line, DOMAIN_PREFIX, DOMAIN_SEPARATOR)
+                if abp_domain:
+                    handle_abp_line(line, abp_domain, state, ctx, stats)
+                    continue
 
-            if is_whitelist_rule:
-                stats["abp_whitelists_removed"] += 1
-                continue
+                if is_whitelist_rule:
+                    stats["abp_whitelists_removed"] += 1
+                    continue
 
-            if _looks_like_plain_domain(line) and domain_regex.match(line):
-                handle_plain_domain_line(line, state, ctx, stats)
-                continue
+                if _looks_like_plain_domain(line) and domain_regex.match(line):
+                    handle_plain_domain_line(line, state, ctx, stats)
+                    continue
 
-            handle_other_line(line, state, stats)
+                handle_other_line(line, state, stats)
 
     out_path = Path(merged_out)
     out_dir = out_path.parent

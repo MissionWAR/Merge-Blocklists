@@ -437,12 +437,18 @@ def has_parent_domain(domain: str, domain_set: set[str]) -> bool:
 
     Example:
         has_parent_domain("a.b.c", {"b.c"}) -> True
+    
+    Optimized to use walk_suffixes generator instead of repeated split/join operations.
     """
     if not domain or not domain_set:
         return False
-    parts = domain.split(".")
-    for i in range(1, len(parts)):
-        if ".".join(parts[i:]) in domain_set:
+    # Skip the domain itself (first suffix) and check parents only
+    first = True
+    for suffix in walk_suffixes(domain):
+        if first:
+            first = False
+            continue
+        if suffix in domain_set:
             return True
     return False
 

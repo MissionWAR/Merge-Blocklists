@@ -21,9 +21,10 @@ from scripts import utils
 # Import constants and utilities from utils to avoid duplication
 IO_BUFFER_SIZE = utils.IO_BUFFER_SIZE
 
+
 # Use utils implementations for consistency
 _find_unescaped_char = utils.find_unescaped_char
-_ELEMENT_HIDING_PATTERN = utils.ELEMENT_HIDING_PATTERN_RE  # Shared precompiled regex
+
 logging.basicConfig(
     level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s"
 )
@@ -31,9 +32,6 @@ logger = logging.getLogger(__name__)
 RC_KEYS = utils.REMOVE_COMMENTS_STATS_KEYS
 
 
-def _contains_element_hiding_marker(s: str) -> bool:
-    """Return True if the line contains element-hiding or scriptlet markers."""
-    return bool(_ELEMENT_HIDING_PATTERN.search(s))
 
 
 def _skip_regex_literal(s: str, opening_slash_idx: int) -> int:
@@ -62,8 +60,9 @@ def _strip_trailing_hash_safe(s: str) -> str:
         return ""
 
     # preserve element-hiding/scriptlet-containing lines as-is: validator handles them
-    if _contains_element_hiding_marker(s):
+    if utils.is_element_hiding_rule(s):
         return s.rstrip()
+
 
     scan_idx = 0
     length = len(s)

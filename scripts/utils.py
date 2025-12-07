@@ -113,9 +113,7 @@ _DOMAIN_REGEX = re.compile(
 _ETC_HOSTS_REGEX = re.compile(
     r"^([0-9A-Fa-f:\.\[\]]+)(?:%[a-zA-Z0-9]+)?\s+([^#]+)(?:#.*)?$"
 )
-_DOMAIN_PATTERN_RE = re.compile(
-    r"(\*\.)?([^\s\^$|=]+(?:\.[^\s\^$|=]+)+)", flags=re.UNICODE
-)
+
 _NON_ASCII_RE = re.compile(r"[^\x00-\x7F]")
 _ABP_HOSTNAME_RE = re.compile(r"^\|\|([^\^]+)\^$", flags=re.IGNORECASE)
 _COMMENT_SEPARATOR_RE = re.compile(r"^[-=*_\.]{3,}$")
@@ -245,6 +243,14 @@ def process_text_rule_files(
         raise FileNotFoundError(f"Input path not found: {input_path}")
 
     return results
+
+
+
+def is_element_hiding_rule(line: str) -> bool:
+    """
+    Return True if the line contains element-hiding or scriptlet markers (##, #@#, #%#).
+    """
+    return bool(_ELEMENT_HIDING_PATTERN_RE.search(line))
 
 
 # -------------------------
@@ -431,12 +437,18 @@ def has_parent_domain(domain: str, domain_set: set[str]) -> bool:
 
     Example:
         has_parent_domain("a.b.c", {"b.c"}) -> True
+    
+    Optimized to use walk_suffixes generator instead of repeated split/join operations.
     """
     if not domain or not domain_set:
         return False
-    parts = domain.split(".")
-    for i in range(1, len(parts)):
-        if ".".join(parts[i:]) in domain_set:
+    # Skip the domain itself (first suffix) and check parents only
+    first = True
+    for suffix in walk_suffixes(domain):
+        if first:
+            first = False
+            continue
+        if suffix in domain_set:
             return True
     return False
 
@@ -511,22 +523,7 @@ def build_plain_domain_minimal_set(
     return minimal_covering_set(plain_domains)
 
 
-def is_domain_covered_by_wildcard(domain: str, wildcard_roots: set[str]) -> bool:
-    """
-    Return True if `domain` is covered by a wildcard in `wildcard_roots`.
 
-    Example:
-        wildcard_roots = {"example.com"}
-        is_domain_covered_by_wildcard("foo.example.com", wildcard_roots) -> True
-        is_domain_covered_by_wildcard("example.com", wildcard_roots) -> False
-    """
-    if not domain or not wildcard_roots or "." not in domain:
-        return False
-    parts = domain.split(".")
-    for i in range(1, len(parts)):
-        if ".".join(parts[i:]) in wildcard_roots:
-            return True
-    return False
 
 
 # -------------------------
@@ -645,32 +642,7 @@ def load_adblock_rule_properties(rule_text: str) -> dict:
 # -------------------------
 
 
-def convert_non_ascii_to_punycode(line: str) -> str:
-    """Replace domain-like substrings with punycode equivalents (no-op for
-    ASCII)."""
-    if not _NON_ASCII_RE.search(line):
-        return line
 
-    def _repl(m: re.Match) -> str:
-        wildcard = m.group(1) or ""
-        domain = m.group(2)
-        if _NON_ASCII_RE.search(domain):
-            return wildcard + to_punycode(domain)
-        return m.group(0)
-
-    try:
-        return _DOMAIN_PATTERN_RE.sub(_repl, line)
-    except re.error:
-        return line
-
-
-@lru_cache(maxsize=8192)
-def is_just_domain(token: str) -> bool:
-    """Return True if token is a syntactically valid domain (strict match)."""
-    if not token:
-        return False
-    t = token.strip().lower().strip(".")
-    return bool(_DOMAIN_REGEX.fullmatch(t))
 
 # Exports
 # -------------------------
@@ -679,6 +651,7 @@ __all__ = [
     # Functions
     "is_blank_line",
     "is_comment_line",
+    "is_element_hiding_rule",
     "list_text_rule_files",
     "contains_non_ascii_characters",
     "substring_between",
@@ -689,16 +662,15 @@ __all__ = [
     "parse_rule_tokens",
     "extract_hostname",
     "load_adblock_rule_properties",
-    "convert_non_ascii_to_punycode",
+
     "normalize_domain_token",
     "to_punycode",
-    "is_just_domain",
+
     "find_unescaped_char",
     "find_last_unescaped_dollar",
     "walk_suffixes",
     "has_parent_domain",
     "minimal_covering_set",
-    "is_domain_covered_by_wildcard",
     # Constants
     "DOMAIN_PREFIX",
     "DOMAIN_SEPARATOR",

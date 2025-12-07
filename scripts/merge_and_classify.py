@@ -28,12 +28,8 @@ DOMAIN_SEPARATOR = utils.DOMAIN_SEPARATOR
 IO_BUFFER_SIZE = utils.IO_BUFFER_SIZE
 substring_between = utils.substring_between
 normalize_domain_token = utils.normalize_domain_token
-walk_suffixes = utils.walk_suffixes
-has_parent = utils.has_parent_domain
 minimal_covering_set = utils.minimal_covering_set
-
-# compatibility shim for legacy tests
-_walk_suffixes = utils.walk_suffixes
+walk_suffixes = utils.walk_suffixes  # Used internally by _cached_suffixes
 
 
 LOCAL_ONLY_HOSTNAMES = {
@@ -57,7 +53,7 @@ LOCAL_ONLY_HOSTNAMES = {
 }
 
 
-@lru_cache(maxsize=262144)
+@lru_cache(maxsize=524288)
 def _cached_suffixes(domain: str) -> tuple[str, ...]:
     """Return cached tuple of suffixes for repeated lookups."""
     return tuple(walk_suffixes(domain))
@@ -70,7 +66,7 @@ def _make_wildcard_checker(wildcard_roots: set[str]) -> Callable[[str], bool]:
 
     roots = frozenset(wildcard_roots)
 
-    @lru_cache(maxsize=131072)
+    @lru_cache(maxsize=262144)
     def _covered(domain: str) -> bool:
         if not domain or "." not in domain:
             return False
@@ -83,20 +79,45 @@ def _make_wildcard_checker(wildcard_roots: set[str]) -> Callable[[str], bool]:
     return _covered
 
 
-def _make_whitelist_checker(whitelist: set[str]) -> Callable[[str], bool]:
-    """Return cached predicate that checks whitelist coverage."""
-    if not whitelist:
+def _make_whitelist_checker(
+    whitelist: set[str], whitelist_wildcards: set[str] | None = None
+) -> Callable[[str], bool]:
+    """
+    Return cached predicate that checks whitelist coverage.
+
+    Args:
+        whitelist: Regular whitelist domains (@@||domain^) — covers domain + all subdomains
+        whitelist_wildcards: Wildcard whitelist domains (@@||*.domain^) — covers only subdomains, NOT apex
+
+    The distinction is important:
+        - @@||example.com^ → whitelists example.com AND sub.example.com
+        - @@||*.example.com^ → whitelists sub.example.com but NOT example.com
+    """
+    has_regular = bool(whitelist)
+    has_wildcards = bool(whitelist_wildcards)
+
+    if not has_regular and not has_wildcards:
         return lambda _domain: False
 
-    whitelist_lookup = frozenset(whitelist)
+    whitelist_lookup = frozenset(whitelist) if whitelist else frozenset()
+    wildcard_lookup = frozenset(whitelist_wildcards) if whitelist_wildcards else frozenset()
 
-    @lru_cache(maxsize=131072)
+    @lru_cache(maxsize=262144)
     def _is_whitelisted(domain: str) -> bool:
         if not domain:
             return False
-        if domain in whitelist_lookup:
-            return True
-        return _has_parent_cached(domain, whitelist_lookup)
+        # Check regular whitelists (exact match or parent match)
+        if whitelist_lookup:
+            if domain in whitelist_lookup:
+                return True
+            if _has_parent_cached(domain, whitelist_lookup):
+                return True
+        # Check wildcard whitelists (parent match only, NOT exact match)
+        # @@||*.example.com^ should whitelist sub.example.com but NOT example.com
+        if wildcard_lookup:
+            if _has_parent_cached(domain, wildcard_lookup):
+                return True
+        return False
 
     return _is_whitelisted
 
@@ -107,7 +128,7 @@ def _make_abp_coverage_checker(
     """Return cached predicate that checks ABP coverage (roots + wildcards)."""
     abp_lookup = frozenset(abp_minimal)
 
-    @lru_cache(maxsize=131072)
+    @lru_cache(maxsize=262144)
     def _covered(domain: str) -> bool:
         if not domain:
             return False
@@ -144,6 +165,17 @@ def _is_bare_abp_rule(
     if re_abp_bare.match(rule_text):
         return True
     return is_wildcard_subdomain and "$" not in rule_text
+
+
+def _has_important_modifier(rule_text: str) -> bool:
+    """Return True if the ABP rule has the $important modifier."""
+    # Optimize: avoid .lower() on entire string; check common patterns first
+    if "$important" in rule_text:
+        return True
+    if "$IMPORTANT" in rule_text:
+        return True
+    # Fallback for mixed case (rare)
+    return "$important" in rule_text.lower()
 
 
 def _abp_rule_is_redundant(
@@ -358,6 +390,10 @@ def handle_abp_line(
         stats["abp_blocks_removed_by_whitelist"] += 1
         return True
 
+    if is_wildcard_subdomain and dn_norm in ctx.whitelist_wildcards:
+        stats["abp_blocks_removed_by_whitelist"] += 1
+        return True
+
     def _remove_conflicting_hosts_for_domain() -> None:
         """Drop existing hosts entries for the same domain before keeping the ABP rule."""
         prev_host_entry = state.domain_map.get(dn_norm)
@@ -412,7 +448,25 @@ def handle_abp_line(
         prev_is_bare = _is_bare_abp_rule(
             prev_text, prev_is_wildcard, ctx.re_abp_bare
         )
+        prev_has_important = _has_important_modifier(prev_text)
+        new_has_important = _has_important_modifier(line)
+
+        # Both bare → skip new (duplicate)
         if is_bare_rule and prev_is_bare:
+            stats["duplicates_removed"] += 1
+            return True
+
+        # New has $important, old is bare → replace old with new
+        if new_has_important and prev_is_bare:
+            state.remove_rule(prev_text)
+            state.domain_map.pop(map_key, None)
+            if stats.get("lines_out", 0) > 0:
+                stats["lines_out"] -= 1
+            stats["duplicates_removed"] += 1
+            # Fall through to add the new $important rule below
+
+        # New is bare, old has $important → skip new (old is stronger)
+        elif prev_has_important and is_bare_rule:
             stats["duplicates_removed"] += 1
             return True
 
@@ -537,6 +591,7 @@ class MergeContext:
         wildcard_covered: Predicate checking wildcard coverage for ABP rules.
         is_whitelisted: Predicate for whitelist coverage (cross-format).
         whitelist_domains: Normalized whitelist domains collected upfront.
+        whitelist_wildcards: Normalized wildcard whitelist domains collected upfront.
         plain_minimal: Minimal covering set of plain domains from inputs.
         abp_minimal: Minimal covering set of ABP blocking domains.
         abp_wildcards: Bare domains extracted from wildcard ABP rules (||*.d^).
@@ -550,6 +605,7 @@ class MergeContext:
     wildcard_covered: Callable[[str], bool]
     is_whitelisted: Callable[[str], bool]
     whitelist_domains: set[str]
+    whitelist_wildcards: set[str]
     plain_minimal: set[str]
     abp_minimal: set[str]
     abp_wildcards: set[str]
@@ -559,10 +615,13 @@ class MergeContext:
 # ----------------------------------------
 # IP helpers
 # ----------------------------------------
+@lru_cache(maxsize=1024)
 def _canonicalize_ip(ip_raw: str) -> tuple[str | None, bool, bool]:
     """
     Return (canonical_ip, is_unspecified, is_loopback).
     Handles zone IDs in IPv6 addresses.
+    
+    Cached because the same IPs (0.0.0.0, 127.0.0.1, ::1) appear thousands of times.
     """
     canonical = utils.canonicalize_ip(ip_raw)
     if canonical is None:
@@ -576,28 +635,41 @@ def _canonicalize_ip(ip_raw: str) -> tuple[str | None, bool, bool]:
 
 
 # ----------------------------------------
-# ABP first-pass collection (optimized single-pass with caching)
+# ABP first-pass collection (memory-optimized: no line caching)
 # ----------------------------------------
-def collect_abp_and_cache_lines(
+def collect_abp_sets(
     input_dir: str,
-) -> tuple[dict[str, set[str]], dict[str, list[str]]]:
-    """Process input files once to collect ABP/whitelist data and cache stripped lines."""
+) -> tuple[dict[str, set[str]], list[Path]]:
+    """
+    First pass: collect ABP/whitelist/wildcard/plain domain sets.
+    
+    Memory optimization: Does NOT cache all lines in memory. Returns file paths
+    for the second pass to re-read (fast due to OS file cache).
+    
+    Returns:
+        (sets_dict, file_paths) where sets_dict contains:
+        - raw_abp: All ABP blocking domains (non-wildcard)
+        - abp_minimal: Minimal covering set of ABP domains
+        - wildcard_roots: Domains from wildcard rules (||*.domain^)
+        - whitelist_domains: Domains from whitelist rules (@@||domain^)
+        - plain_candidates: Plain domain candidates
+    """
     raw_abp: set[str] = set()
     wildcard_roots: set[str] = set()
     whitelist_domains: set[str] = set()
+    whitelist_wildcards: set[str] = set()  # @@||*.domain^ rules (subdomains only)
     plain_candidates: set[str] = set()
-    file_lines_cache: dict[str, list[str]] = {}
 
     domain_regex = utils.DOMAIN_REGEX
     is_hosts_rule = utils.is_etc_hosts_rule
     normalize = normalize_domain_token
 
-    for file_path in utils.list_text_rule_files(input_dir):
-        lines: list[str] = []
+    file_paths = utils.list_text_rule_files(input_dir)
+    
+    for file_path in file_paths:
         with file_path.open(encoding="utf-8-sig", errors="replace") as f:
             for line in f:
                 line = line.strip()
-                lines.append(line)
 
                 if not line:
                     continue
@@ -613,7 +685,11 @@ def collect_abp_and_cache_lines(
                         continue
 
                     if is_whitelist_rule:
-                        whitelist_domains.add(dn_norm)
+                        # Distinguish @@||*.domain^ (wildcard) from @@||domain^ (regular)
+                        if abp_domain.startswith("*.") and "." in abp_domain[2:]:
+                            whitelist_wildcards.add(dn_norm)
+                        else:
+                            whitelist_domains.add(dn_norm)
                         continue
 
                     if abp_domain.startswith("*.") and "." in abp_domain[2:]:
@@ -633,15 +709,14 @@ def collect_abp_and_cache_lines(
                     if dn_norm:
                         plain_candidates.add(dn_norm)
 
-        file_lines_cache[file_path.name] = lines
-
     return {
         "raw_abp": raw_abp,
         "abp_minimal": minimal_covering_set(raw_abp),
         "wildcard_roots": wildcard_roots,
         "whitelist_domains": whitelist_domains,
+        "whitelist_wildcards": whitelist_wildcards,
         "plain_candidates": plain_candidates,
-    }, file_lines_cache
+    }, file_paths
 
 
 # ----------------------------------------
@@ -653,15 +728,18 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
     if not in_path.is_dir():
         raise FileNotFoundError(f"Input directory not found: {input_dir}")
 
-    abp_sets, file_lines_cache = collect_abp_and_cache_lines(input_dir)
+    # First pass: collect ABP/whitelist/wildcard sets (memory-efficient, no line caching)
+    abp_sets, file_paths = collect_abp_sets(input_dir)
     abp_minimal: set[str] = abp_sets["abp_minimal"]
     abp_wildcards: set[str] = abp_sets["wildcard_roots"]
     whitelist_domains: set[str] = abp_sets.get("whitelist_domains", set())
     plain_candidates: set[str] = abp_sets.get("plain_candidates", set())
 
+    whitelist_wildcards: set[str] = abp_sets.get("whitelist_wildcards", set())
+
     wildcard_covered = _make_wildcard_checker(abp_wildcards)
     covered_by_abp = _make_abp_coverage_checker(abp_minimal, wildcard_covered)
-    is_whitelisted = _make_whitelist_checker(whitelist_domains)
+    is_whitelisted = _make_whitelist_checker(whitelist_domains, whitelist_wildcards)
 
     stats = {
         "files": 0,
@@ -702,6 +780,7 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
         wildcard_covered=wildcard_covered,
         is_whitelisted=is_whitelisted,
         whitelist_domains=whitelist_domains,
+        whitelist_wildcards=whitelist_wildcards,
         plain_minimal=plain_minimal,
         abp_minimal=abp_minimal,
         abp_wildcards=abp_wildcards,
@@ -709,43 +788,44 @@ def transform(input_dir: str, merged_out: str) -> dict[str, int]:
     )
     state = MergeState()
 
-    for filename in sorted(file_lines_cache.keys(), key=lambda n: n.lower()):
-        lines = file_lines_cache[filename]
+    # Second pass: re-read files and process lines (OS file cache makes this fast)
+    for file_path in sorted(file_paths, key=lambda p: p.name.lower()):
         stats["files"] += 1
+        with file_path.open(encoding="utf-8-sig", errors="replace") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                stats["lines_in"] += 1
+                if not line:
+                    continue
 
-        for line in lines:
-            stats["lines_in"] += 1
-            if not line:
-                continue
-
-            is_whitelist_rule = line.startswith("@@")
-            first_char = line[0]
-            looks_like_hosts = (
-                (" " in line or "\t" in line)
-                and (
-                    first_char.isdigit()
-                    or first_char in ("[", ":")
-                    or first_char.lower() in "abcdef"
+                is_whitelist_rule = line.startswith("@@")
+                first_char = line[0]
+                looks_like_hosts = (
+                    (" " in line or "\t" in line)
+                    and (
+                        first_char.isdigit()
+                        or first_char in ("[", ":")
+                        or first_char.lower() in "abcdef"
+                    )
                 )
-            )
-            if looks_like_hosts and is_hosts_re(line):
-                handle_hosts_line(line, state, ctx, stats)
-                continue
+                if looks_like_hosts and is_hosts_re(line):
+                    handle_hosts_line(line, state, ctx, stats)
+                    continue
 
-            abp_domain = substring_between(line, DOMAIN_PREFIX, DOMAIN_SEPARATOR)
-            if abp_domain:
-                handle_abp_line(line, abp_domain, state, ctx, stats)
-                continue
+                abp_domain = substring_between(line, DOMAIN_PREFIX, DOMAIN_SEPARATOR)
+                if abp_domain:
+                    handle_abp_line(line, abp_domain, state, ctx, stats)
+                    continue
 
-            if is_whitelist_rule:
-                stats["abp_whitelists_removed"] += 1
-                continue
+                if is_whitelist_rule:
+                    stats["abp_whitelists_removed"] += 1
+                    continue
 
-            if _looks_like_plain_domain(line) and domain_regex.match(line):
-                handle_plain_domain_line(line, state, ctx, stats)
-                continue
+                if _looks_like_plain_domain(line) and domain_regex.match(line):
+                    handle_plain_domain_line(line, state, ctx, stats)
+                    continue
 
-            handle_other_line(line, state, stats)
+                handle_other_line(line, state, stats)
 
     out_path = Path(merged_out)
     out_dir = out_path.parent
